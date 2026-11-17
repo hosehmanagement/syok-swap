@@ -13,7 +13,7 @@ new = (
     "        from sam2 import _C\n"
     "        return _C.get_connected_componnets(mask.to(torch.uint8).contiguous())\n"
     "    except ImportError:\n"
-    "        from sam2_cc_fallback import get_connected_components_cpu\n"
+    "        from sam2.sam2_cc_fallback import get_connected_components_cpu\n"
     "        return get_connected_components_cpu(mask)"
 )
 src.write_text(text.replace(old, new))
