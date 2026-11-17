@@ -1,0 +1,139 @@
+"""Syok Swap: replace the person in a video with a character from one photo.
+
+Engine: Wan2.2-Animate-14B (Apache-2.0) in replacement mode, on Modal.
+Two steps so you never pay for a bad mask:
+  1. preview  (small GPU, cents): finds the person, writes a red-overlay mask video + coverage stats.
+  2. render   (H100): generates, pastes the result over the ORIGINAL frames, restores the ORIGINAL soundtrack.
+
+    modal run app.py::fetch                                   # one time, downloads ~50 GB of weights
+    modal run app.py::preview --video v.mp4 --image face.png --consent yes
+    modal run app.py::render  --job <id>
+"""
+import json
+import os
+import shutil
+import subprocess
+import uuid
+from pathlib import Path
+
+import modal
+
+WAN_REF = "1ea34ff48f87168174e12956e200b1d908b1c5ff"  # Wan-Video/Wan2.2, pinned
+WEIGHTS = "/cache/Wan2.2-Animate-14B"
+JOBS = "/cache/jobs"
+
+app = modal.App("syok-swap")
+cache = modal.Volume.from_name("syok-swap-cache", create_if_missing=True)
+
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("git", "ffmpeg", "libgl1", "libglib2.0-0")
+    .pip_install("torch==2.6.0", "torchvision==0.21.0")
+    .run_commands(f"git clone https://github.com/Wan-Video/Wan2.2 /opt/wan && cd /opt/wan && git checkout {WAN_REF}")
+    .run_commands("cd /opt/wan && grep -v flash_attn requirements.txt > /tmp/req.txt && pip install -r /tmp/req.txt")
+    .run_commands("cd /opt/wan && pip install -r requirements_animate.txt")
+    .pip_install("huggingface_hub[hf_transfer]")
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "PYTHONPATH": "/opt/wan"})
+    .add_local_file(Path(__file__).parent / "swapkit.py", "/opt/swapkit.py")
+)
+
+
+@app.function(image=image, volumes={"/cache": cache}, timeout=7200, cpu=4)
+def fetch_weights():
+    from huggingface_hub import snapshot_download
+    snapshot_download("Wan-AI/Wan2.2-Animate-14B", local_dir=WEIGHTS)
+    cache.commit()
+    return sorted(p.name for p in Path(WEIGHTS).iterdir())
+
+
+def _sk():
+    import sys
+    sys.path.insert(0, "/opt")
+    import swapkit
+    return swapkit
+
+
+@app.function(image=image, gpu="L4", volumes={"/cache": cache}, timeout=1800)
+def make_preview(video: bytes, photo: bytes, photo_ext: str, resolution: str, margin: str, start: float, length: float):
+    sk = _sk()
+    cache.reload()
+    job = uuid.uuid4().hex[:10]
+    d = Path(JOBS) / job
+    (d / "proc").mkdir(parents=True)
+    raw = d / "raw.mp4"
+    raw.write_bytes(video)
+    ref = d / f"person{photo_ext}"
+    ref.write_bytes(photo)
+    info = sk.probe(raw)
+    s, l = sk.plan_section(info["duration"], start, length)
+    sec = d / "section.mp4"
+    sk.cut_section(raw, sec, s, l)
+    it, k = sk.MARGINS[margin]
+    w, h = sk.RESOLUTIONS[resolution]
+    pre = "/opt/wan/wan/modules/animate/preprocess"
+    r = subprocess.run(
+        ["python", "preprocess_data.py", "--ckpt_path", f"{WEIGHTS}/process_checkpoint", "--video_path", str(sec),
+         "--refer_path", str(ref), "--save_path", str(d / "proc"), "--resolution_area", str(w), str(h),
+         "--replace_flag", "--iterations", str(it), "--k", str(k)],
+        cwd=pre, capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError("preprocess failed:\n" + (r.stdout + r.stderr)[-2500:])
+    mask, inverted = sk.normalize_mask(d / "proc" / "src_mask.mp4", d / "mask.mp4")
+    stats = sk.mask_stats(mask)
+    sk.mask_preview(sec, mask, d / "preview.mp4")
+    meta = {"job": job, "section": [s, l], "resolution": resolution, "margin": margin, "mask_inverted": inverted, "stats": stats}
+    (d / "meta.json").write_text(json.dumps(meta, indent=1))
+    cache.commit()
+    return meta, (d / "preview.mp4").read_bytes()
+
+
+@app.function(image=image, gpu="H100", volumes={"/cache": cache}, timeout=3600)
+def render_job(job: str, relight: bool = True, feather: int = 7):
+    sk = _sk()
+    cache.reload()
+    d = Path(JOBS) / job
+    meta = json.loads((d / "meta.json").read_text())
+    if meta["stats"]["warnings"] and any("empty" in x for x in meta["stats"]["warnings"]):
+        raise ValueError("Refusing to render: " + "; ".join(meta["stats"]["warnings"]))
+    gen = d / "generated.mp4"
+    cmd = ["python", "generate.py", "--task", "animate-14B", "--ckpt_dir", WEIGHTS,
+           "--src_root_path", str(d / "proc"), "--refert_num", "1", "--replace_flag", "--save_file", str(gen)]
+    if relight:
+        cmd.append("--use_relighting_lora")
+    r = subprocess.run(cmd, cwd="/opt/wan", capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError("generate failed:\n" + (r.stdout + r.stderr)[-2500:])
+    comp = d / "composite.mp4"
+    sk.composite_over_original(d / "section.mp4", gen, d / "mask.mp4", comp, feather=feather)
+    final, had_audio = sk.mux_original_audio(comp, d / "section.mp4", d / "final.mp4")
+    meta.update(done=True, had_audio=had_audio)
+    (d / "meta.json").write_text(json.dumps(meta, indent=1))
+    cache.commit()
+    return (d / "final.mp4").read_bytes(), (gen).read_bytes()
+
+
+@app.local_entrypoint()
+def fetch():
+    print(fetch_weights.remote())
+
+
+@app.local_entrypoint()
+def preview(video: str, image: str, consent: str = "", resolution: str = "480p", margin: str = "normal",
+            start: float = 0.0, length: float = 0.0, out: str = "preview.mp4"):
+    if consent != "yes":
+        raise SystemExit("Only use photos and videos of people who agreed to it (or fictional characters). Re-run with --consent yes.")
+    ext = Path(image).suffix.lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".webp"):
+        raise SystemExit("Character photo must be png, jpg or webp.")
+    meta, pv = make_preview.remote(Path(video).read_bytes(), Path(image).read_bytes(), ext, resolution, margin, start, length)
+    Path(out).write_bytes(pv)
+    print(json.dumps(meta, indent=1))
+    print(f"Mask preview saved to {out}. Check it, then: modal run app.py::render --job {meta['job']}")
+
+
+@app.local_entrypoint()
+def render(job: str, out: str = "swap.mp4", relight: bool = True):
+    final, raw = render_job.remote(job, relight)
+    Path(out).write_bytes(final)
+    Path(out.replace(".mp4", "_raw.mp4")).write_bytes(raw)
+    print("Saved", out)
