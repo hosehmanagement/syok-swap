@@ -59,7 +59,7 @@ def _sk():
     return swapkit
 
 
-@app.function(image=image, gpu="L4", volumes={"/cache": cache}, timeout=1800)
+@app.function(image=image, gpu=["L4", "A10G", "L40S"], volumes={"/cache": cache}, timeout=1800)
 def make_preview(video: bytes, photo: bytes, photo_ext: str, resolution: str, margin: str, start: float, length: float):
     sk = _sk()
     cache.reload()
