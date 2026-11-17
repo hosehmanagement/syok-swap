@@ -33,7 +33,7 @@ image = (
     .run_commands("cd /opt/wan && grep -v flash_attn requirements.txt > /tmp/req.txt && pip install -r /tmp/req.txt")
     .run_commands("cd /opt/wan && grep -v -i sam2 requirements_animate.txt > /tmp/reqa.txt && pip install -r /tmp/reqa.txt")
     # SAM2's setup.py imports torch while building, so build without isolation; skip its CUDA extension (no nvcc here)
-    .run_commands("SAM2_BUILD_CUDA=0 pip install --no-build-isolation 'git+https://github.com/facebookresearch/sam2.git@0e78a118995e66bb27d78518c4bd9a3e95b4e266'")
+    .run_commands("mkdir -p /tmp/fakecuda/lib64 && CUDA_HOME=/tmp/fakecuda SAM2_BUILD_CUDA=0 SAM2_BUILD_ALLOW_ERRORS=1 pip install --no-build-isolation 'git+https://github.com/facebookresearch/sam2.git@0e78a118995e66bb27d78518c4bd9a3e95b4e266'")
     .pip_install("huggingface_hub[hf_transfer]")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "PYTHONPATH": "/opt/wan"})
     .add_local_file(Path(__file__).parent / "swapkit.py", "/opt/swapkit.py")
