@@ -84,3 +84,19 @@ def test_normalize_mask_inverts_when_background_is_white(tmp_path):
     assert f[25, 30, 0] > 200 and f[2, 2, 0] < 50
     out2, inv2 = sk.normalize_mask(make_video(tmp_path / "k.mp4", (0, 0, 0), box=(10, 10, 40, 40)), tmp_path / "n2.mp4")
     assert not inv2
+
+
+def test_cc_fallback_matches_contract():
+    import torch
+    from sam2_cc_fallback import get_connected_components_cpu
+    m = torch.zeros(2, 1, 8, 8, dtype=torch.uint8)
+    m[0, 0, 1:3, 1:3] = 1      # 4-pixel blob
+    m[0, 0, 5:8, 5:8] = 1      # 9-pixel blob
+    m[1, 0, 0, 0] = 1          # 1-pixel blob
+    m[1, 0, 1, 1] = 1          # touches only diagonally -> separate under 4-connectivity
+    labels, counts = get_connected_components_cpu(m)
+    assert labels.shape == m.shape and counts.shape == m.shape
+    assert counts[0, 0, 1, 1].item() == 4 and counts[0, 0, 6, 6].item() == 9
+    assert counts[0, 0, 0, 0].item() == 0 and labels[0, 0, 0, 0].item() == 0
+    assert labels[0, 0, 1, 1] != labels[0, 0, 6, 6]
+    assert counts[1, 0, 0, 0].item() == 1 and counts[1, 0, 1, 1].item() == 1

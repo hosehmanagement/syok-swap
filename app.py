@@ -34,6 +34,10 @@ image = (
     .run_commands("cd /opt/wan && grep -v -i sam2 requirements_animate.txt > /tmp/reqa.txt && pip install -r /tmp/reqa.txt")
     # SAM2's setup.py imports torch while building, so build without isolation; skip its CUDA extension (no nvcc here)
     .run_commands("pip install hydra-core iopath 'moviepy<2' && git clone -q https://github.com/facebookresearch/sam2.git /tmp/sam2 && cd /tmp/sam2 && git checkout -q 0e78a118995e66bb27d78518c4bd9a3e95b4e266 && SP=\"$(python -c 'import site;print(site.getsitepackages()[0])')\" && cp -r sam2 \"$SP/sam2\" && cp -r sam2_configs \"$SP/sam2_configs\" && python -c 'import sam2, os; print(sam2.__file__)'")
+    # SAM2's connected-components op is a CUDA extension we don't build; patch in the tested CPU fallback
+    .add_local_file(Path(__file__).parent / "sam2_cc_fallback.py", "/opt/sam2_cc_fallback.py", copy=True)
+    .add_local_file(Path(__file__).parent / "patch_sam2.py", "/opt/patch_sam2.py", copy=True)
+    .run_commands("python /opt/patch_sam2.py")
     .pip_install("huggingface_hub[hf_transfer]")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "PYTHONPATH": "/opt/wan"})
     .add_local_file(Path(__file__).parent / "swapkit.py", "/opt/swapkit.py")
