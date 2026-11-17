@@ -137,3 +137,31 @@ def render(job: str, out: str = "swap.mp4", relight: bool = True):
     Path(out).write_bytes(final)
     Path(out.replace(".mp4", "_raw.mp4")).write_bytes(raw)
     print("Saved", out)
+
+
+# ---- test helper: make a FICTIONAL character photo (FLUX.1-schnell, Apache-2.0) so tests never use real faces ----
+face_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install("torch==2.6.0", "diffusers>=0.32", "transformers", "accelerate", "sentencepiece", "protobuf")
+)
+
+
+@app.function(image=face_image, gpu="L40S", volumes={"/cache": cache}, timeout=1200)
+def test_face(prompt: str, seed: int = 7):
+    import torch
+    from diffusers import FluxPipeline
+    p = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16,
+                                     cache_dir="/cache/hf").to("cuda")
+    img = p(prompt, height=1024, width=768, num_inference_steps=4, guidance_scale=0.0,
+            generator=torch.Generator("cuda").manual_seed(seed)).images[0]
+    import io
+    b = io.BytesIO(); img.save(b, "PNG")
+    cache.commit()
+    return b.getvalue()
+
+
+@app.local_entrypoint()
+def face(prompt: str = "photorealistic portrait of a fictional middle-aged man with short black hair, thick eyebrows, brown eyes, stubble, dark blue jacket, plain grey background, soft daylight, looking at the camera",
+         out: str = "fictional_man.png", seed: int = 7):
+    Path(out).write_bytes(test_face.remote(prompt, seed))
+    print("saved", out)
