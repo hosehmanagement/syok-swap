@@ -113,8 +113,17 @@ def render_job(job: str, relight: bool = True, feather: int = 7):
     for name in ("section.mp4", "mask.mp4"):
         shutil.copy(d / name, w / name)
     import cv2
-    if cv2.imread(str(w / "proc" / "src_ref.png")) is None:
-        raise RuntimeError(f"Reference image unreadable even from local disk: {(w / 'proc' / 'src_ref.png').stat().st_size} bytes")
+    # Inside generate.py, cv2.imread of a PNG dies with "libpng error: bad parameters to zlib" (a zlib clash with another
+    # library loaded in that process). cv2.imread picks the decoder from the file CONTENT, so store the reference as BMP
+    # bytes under the name Wan expects: same pixels, no zlib involved.
+    ref_png = w / "proc" / "src_ref.png"
+    img = cv2.imread(str(ref_png))
+    if img is None:
+        raise RuntimeError(f"Reference image unreadable: {ref_png.stat().st_size} bytes")
+    ok, buf = cv2.imencode(".bmp", img)
+    if not ok:
+        raise RuntimeError("Could not re-encode the reference image")
+    ref_png.write_bytes(buf.tobytes())
     gen = w / "generated.mp4"
     cmd = ["python", "generate.py", "--task", "animate-14B", "--ckpt_dir", WEIGHTS,
            "--src_root_path", str(w / "proc"), "--refert_num", "1", "--replace_flag", "--save_file", str(gen)]
