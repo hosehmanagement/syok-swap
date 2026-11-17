@@ -105,17 +105,29 @@ def render_job(job: str, relight: bool = True, feather: int = 7):
     meta = json.loads((d / "meta.json").read_text())
     if meta["stats"]["warnings"] and any("empty" in x for x in meta["stats"]["warnings"]):
         raise ValueError("Refusing to render: " + "; ".join(meta["stats"]["warnings"]))
-    gen = d / "generated.mp4"
+    # work on local disk, not the network volume: generate.py reads src_ref.png with cv2.imread, which returned None
+    # for the volume copy inside the GPU container (the same file reads fine from a CPU container)
+    w = Path("/tmp/work")
+    shutil.rmtree(w, ignore_errors=True)
+    shutil.copytree(d / "proc", w / "proc")
+    for name in ("section.mp4", "mask.mp4"):
+        shutil.copy(d / name, w / name)
+    import cv2
+    if cv2.imread(str(w / "proc" / "src_ref.png")) is None:
+        raise RuntimeError(f"Reference image unreadable even from local disk: {(w / 'proc' / 'src_ref.png').stat().st_size} bytes")
+    gen = w / "generated.mp4"
     cmd = ["python", "generate.py", "--task", "animate-14B", "--ckpt_dir", WEIGHTS,
-           "--src_root_path", str(d / "proc"), "--refert_num", "1", "--replace_flag", "--save_file", str(gen)]
+           "--src_root_path", str(w / "proc"), "--refert_num", "1", "--replace_flag", "--save_file", str(gen)]
     if relight:
         cmd.append("--use_relighting_lora")
     r = subprocess.run(cmd, cwd="/opt/wan", capture_output=True, text=True)
     if r.returncode:
         raise RuntimeError("generate failed:\n" + (r.stdout + r.stderr)[-2500:])
-    comp = d / "composite.mp4"
-    sk.composite_over_original(d / "section.mp4", gen, d / "mask.mp4", comp, feather=feather)
-    final, had_audio = sk.mux_original_audio(comp, d / "section.mp4", d / "final.mp4")
+    comp = w / "composite.mp4"
+    sk.composite_over_original(w / "section.mp4", gen, w / "mask.mp4", comp, feather=feather)
+    final, had_audio = sk.mux_original_audio(comp, w / "section.mp4", w / "final.mp4")
+    shutil.copy(gen, d / "generated.mp4")
+    shutil.copy(final, d / "final.mp4")
     meta.update(done=True, had_audio=had_audio)
     (d / "meta.json").write_text(json.dumps(meta, indent=1))
     cache.commit()
