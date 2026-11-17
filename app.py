@@ -122,6 +122,26 @@ def render_job(job: str, relight: bool = True, feather: int = 7):
     return (d / "final.mp4").read_bytes(), (gen).read_bytes()
 
 
+@app.function(image=image, volumes={"/cache": cache}, timeout=300)
+def inspect_job(job: str):
+    """Cheap CPU helper: list a job's files and check the reference image reads (debugging aid)."""
+    import cv2
+    cache.reload()
+    d = Path(JOBS) / job
+    out = []
+    for p in sorted(d.rglob("*")):
+        if p.is_file():
+            out.append(f"{p.relative_to(d)}  {p.stat().st_size}")
+    ref = d / "proc" / "src_ref.png"
+    out.append(f"imread(src_ref.png) -> {None if cv2.imread(str(ref)) is None else cv2.imread(str(ref)).shape}")
+    return "\n".join(out)
+
+
+@app.local_entrypoint()
+def inspect(job: str):
+    print(inspect_job.remote(job))
+
+
 @app.local_entrypoint()
 def fetch():
     print(fetch_weights.remote())
