@@ -141,7 +141,7 @@ def render(job: str, out: str = "swap.mp4", relight: bool = True):
     print("Saved", out)
 
 
-# ---- test helper: make a FICTIONAL character photo (FLUX.1-schnell, Apache-2.0) so tests never use real faces ----
+# ---- test helper: make a FICTIONAL character photo (SDXL base 1.0, OpenRAIL++; ungated - FLUX.1-schnell needs a gated HF login) so tests never use real faces ----
 face_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("torch==2.6.0", "diffusers>=0.32", "transformers", "accelerate", "sentencepiece", "protobuf")
@@ -151,10 +151,10 @@ face_image = (
 @app.function(image=face_image, gpu="L40S", volumes={"/cache": cache}, timeout=1200)
 def test_face(prompt: str, seed: int = 7):
     import torch
-    from diffusers import FluxPipeline
-    p = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16,
-                                     cache_dir="/cache/hf").to("cuda")
-    img = p(prompt, height=1024, width=768, num_inference_steps=4, guidance_scale=0.0,
+    from diffusers import StableDiffusionXLPipeline
+    p = StableDiffusionXLPipeline.from_pretrained("stabilityai/stable-diffusion-xl-base-1.0", torch_dtype=torch.float16,
+                                              variant="fp16", cache_dir="/cache/hf").to("cuda")
+    img = p(prompt, height=1024, width=768, num_inference_steps=28, guidance_scale=6.0,
             generator=torch.Generator("cuda").manual_seed(seed)).images[0]
     import io
     b = io.BytesIO(); img.save(b, "PNG")
