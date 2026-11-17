@@ -44,6 +44,9 @@ image = (
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "PYTHONPATH": "/opt/wan"})
     # fail the cheap CPU image build, not a paid GPU run, if any import Wan needs is missing (Wan itself touches CUDA on import, so check the packages)
     .run_commands("python -c 'import einops, regex, safetensors, librosa, scipy, decord, peft, onnxruntime, pandas, matplotlib, loguru, sentencepiece, easydict, ftfy, dashscope, imageio, cv2, diffusers, transformers, tokenizers, accelerate, omegaconf, hydra, moviepy, sam2, PIL, tqdm; print(\"third-party imports ok\")'")
+    # Wan's attention asserts FlashAttention-2 is installed (it was left out of the requirements because it is normally compiled
+    # from source). Use the official prebuilt wheel that matches torch 2.6 / CUDA 12 / python 3.11.
+    .run_commands("pip install 'https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl' && python -c \"import importlib.metadata as m; print('flash_attn', m.version('flash_attn'))\"")
     .add_local_file(Path(__file__).parent / "swapkit.py", "/opt/swapkit.py")
 )
 
