@@ -42,8 +42,8 @@ image = (
     # imported by Wan's package but missing from its requirements files (found when a paid H100 run failed on einops)
     .pip_install("einops", "regex", "safetensors", "librosa", "scipy")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "PYTHONPATH": "/opt/wan"})
-    # fail the cheap CPU image build, not a paid GPU run, if any import is still missing
-    .run_commands("cd /opt/wan && python generate.py --help > /dev/null && python -c 'import wan; print(\"wan imports ok\")'")
+    # fail the cheap CPU image build, not a paid GPU run, if any import Wan needs is missing (Wan itself touches CUDA on import, so check the packages)
+    .run_commands("python -c 'import einops, regex, safetensors, librosa, scipy, decord, peft, onnxruntime, pandas, matplotlib, loguru, sentencepiece, easydict, ftfy, dashscope, imageio, cv2, diffusers, transformers, tokenizers, accelerate, omegaconf, hydra, moviepy, sam2, PIL, tqdm; print(\"third-party imports ok\")'")
     .add_local_file(Path(__file__).parent / "swapkit.py", "/opt/swapkit.py")
 )
 
