@@ -178,19 +178,18 @@ def mux_original_audio(video, original, out):
 
 
 def normalize_mask(mask, out):
-    """Make white = the person that gets replaced. Wan's mask may come out the other way round, so a mask that
-    covers most of the frame is inverted (a person almost never fills most of the frame). Returns (path, inverted)."""
+    """Turn Wan's mask into a clean grayscale video. Wan marks the PERSON as white (src_bg = frame * (1 - mask) in
+    wan/modules/animate/preprocess/process_pipepline.py), so the polarity is kept exactly as Wan wrote it - it is never
+    guessed from coverage (a close-up portrait legitimately fills most of the frame). Returns (path, inverted=False)."""
     fs = list(frames(mask))
     if not fs:
         raise ValueError("Mask video has no frames.")
-    inv = float(np.mean([(f.max(axis=2) > 127).mean() for f in fs])) > 0.5
     info = probe(mask)
     w = Writer(out, info["width"], info["height"], info["fps"])
     try:
         for f in fs:
             g = f.max(axis=2)
-            g = 255 - g if inv else g
             w.put(np.repeat(g[..., None], 3, axis=2))
     finally:
         w.close()
-    return out, inv
+    return out, False

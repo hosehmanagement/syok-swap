@@ -71,20 +71,22 @@ def test_mask_preview_runs(tmp_path):
     assert f[20, 20, 2] > 60 and f[2, 2, 2] < 20
 
 
-def test_normalize_mask_inverts_when_background_is_white(tmp_path):
-    # white background, black person box => mean coverage > 0.5 => must be inverted so the person is white
-    m = make_video(tmp_path / "m.mp4", (255, 255, 255), box=None)
+def test_normalize_mask_keeps_wan_polarity_even_for_close_up_portraits(tmp_path):
+    # Regression for the real failure: a close-up portrait fills ~98% of the frame. Wan marks the person white, so a
+    # mask that is mostly white must STAY white (it was wrongly inverted to a thin border before).
     wr = sk.Writer(tmp_path / "w.mp4", 64, 48, 24)
     for _ in range(12):
-        f = np.full((48, 64, 3), 255, np.uint8); f[10:40, 20:40] = 0; wr.put(f)
+        f = np.full((48, 64, 3), 255, np.uint8); f[0:2, :] = 0; wr.put(f)
     wr.close()
     out, inv = sk.normalize_mask(tmp_path / "w.mp4", tmp_path / "n.mp4")
-    assert inv
+    assert not inv
     f = next(sk.frames(out))
-    assert f[25, 30, 0] > 200 and f[2, 2, 0] < 50
+    assert f[25, 30, 0] > 200 and f[0, 30, 0] < 50
+    # and a small person (white box on black) is unchanged too
     out2, inv2 = sk.normalize_mask(make_video(tmp_path / "k.mp4", (0, 0, 0), box=(10, 10, 40, 40)), tmp_path / "n2.mp4")
     assert not inv2
-
+    g = next(sk.frames(out2))
+    assert g[25, 25, 0] > 200 and g[2, 2, 0] < 50
 
 def test_cc_fallback_matches_contract():
     import torch
