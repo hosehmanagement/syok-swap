@@ -39,7 +39,11 @@ image = (
     .add_local_file(Path(__file__).parent / "patch_sam2.py", "/opt/patch_sam2.py", copy=True)
     .run_commands("python /opt/patch_sam2.py")
     .pip_install("huggingface_hub[hf_transfer]")
+    # imported by Wan's package but missing from its requirements files (found when a paid H100 run failed on einops)
+    .pip_install("einops", "regex", "safetensors", "librosa", "scipy")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "PYTHONPATH": "/opt/wan"})
+    # fail the cheap CPU image build, not a paid GPU run, if any import is still missing
+    .run_commands("cd /opt/wan && python generate.py --help > /dev/null && python -c 'import wan; print(\"wan imports ok\")'")
     .add_local_file(Path(__file__).parent / "swapkit.py", "/opt/swapkit.py")
 )
 
