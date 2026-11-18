@@ -55,10 +55,10 @@ def train_cmd(p):
     if not (100 <= p.steps <= 6000):
         raise ValueError("steps must be 100..6000 (a hard cap, so a typo cannot run up a bill)")
     dit, lo, hi, shift = STAGES[p.stage]
-    return ["accelerate", "launch", "--num_cpu_threads_per_process", "1", "--mixed_precision", "bf16", TRAINER,
+    return ["accelerate", "launch", "--num_cpu_threads_per_process", "1", "--mixed_precision", "fp16", TRAINER,
             "--task", "t2v-A14B", "--dit", f"{p.models_dir}/{dit}", "--vae", f"{p.models_dir}/wan_2.1_vae.safetensors",
             "--t5", f"{p.models_dir}/models_t5_umt5-xxl-enc-bf16.pth", "--dataset_config", p.dataset_toml,
-            "--sdpa", "--mixed_precision", "bf16", "--fp8_base", "--fp8_scaled", "--gradient_checkpointing",
+            "--sdpa", "--mixed_precision", "fp16", "--fp8_base", "--fp8_scaled", "--gradient_checkpointing",
             "--optimizer_type", "adamw8bit", "--learning_rate", str(p.lr),
             "--network_module", "networks.lora_wan", "--network_dim", str(p.rank), "--network_alpha", str(p.rank),
             "--timestep_sampling", "shift", "--discrete_flow_shift", str(shift),

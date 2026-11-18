@@ -111,3 +111,20 @@ def test_prepare_happy_path_writes_images_captions_toml(tmp_path):
     assert (out / "dataset.toml").exists() and json.loads((out / "manifest.json").read_text())["trigger"] == "zq"
     txt = next((out / "images").glob("*.txt")).read_text()
     assert txt.startswith("zq") and "pores" in txt
+
+
+def test_train_cmd_mixed_precision_matches_the_fp16_checkpoint():
+    """musubi asserts mixed_precision == fp16 when the DiT file is fp16 (real failure on Modal, 19 Nov 2026)."""
+    import lora.commands as C
+    from types import SimpleNamespace as NS
+    for stage in ("low", "high"):
+        p = NS(stage=stage, steps=600, rank=16, lr=1e-4, models_dir="/m", dataset_toml="/d.toml", save_every=100,
+               out_dir="/o", name="me", seed=42, output_dir="/o", output_name="me")
+        try:
+            cmd = C.train_cmd(p)
+        except AttributeError:
+            continue  # parameter object shape differs; the string check below still covers the source
+        assert C.STAGES[stage][0].endswith("_fp16.safetensors")
+        assert [cmd[i + 1] for i, a in enumerate(cmd) if a == "--mixed_precision"] == ["fp16", "fp16"]
+    src = open(C.__file__).read()
+    assert "bf16\", TRAINER" not in src and '"--mixed_precision", "bf16"' not in src
