@@ -102,3 +102,16 @@ def test_cc_fallback_matches_contract():
     assert counts[0, 0, 0, 0].item() == 0 and labels[0, 0, 0, 0].item() == 0
     assert labels[0, 0, 1, 1] != labels[0, 0, 6, 6]
     assert counts[1, 0, 0, 0].item() == 1 and counts[1, 0, 1, 1].item() == 1
+
+
+def test_composite_full_res_uses_generated_size_and_keeps_detail(tmp_path):
+    orig = make_video(tmp_path / "o.mp4", (10, 200, 10), n=24, fps=24, w=64, h=48)
+    gen = make_video(tmp_path / "g.mp4", (200, 10, 10), n=24, fps=24, w=128, h=96)
+    msk = make_video(tmp_path / "m.mp4", (0, 0, 0), n=24, fps=24, w=128, h=96, box=(40, 30, 88, 66))
+    out = tmp_path / "c.mp4"
+    n = sk.composite_over_original(orig, gen, msk, out, feather=0, full_res=True)
+    info = sk.probe(out)
+    assert n == 24 and (info["width"], info["height"]) == (128, 96)
+    f = next(sk.frames(out))
+    assert f[48, 64, 0] > 150 and f[48, 64, 2] < 80          # centre is the generated colour
+    assert f[3, 3, 1] > 150                                 # background is the (enlarged) original

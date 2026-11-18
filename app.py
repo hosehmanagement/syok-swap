@@ -101,7 +101,7 @@ def make_preview(video: bytes, photo: bytes, photo_ext: str, resolution: str, ma
 
 
 @app.function(image=image, gpu="H100", volumes={"/cache": cache}, timeout=3600)
-def render_job(job: str, relight: bool = True, feather: int = 7):
+def render_job(job: str, relight: bool = True, feather: int = 7, full_res: bool = False):
     sk = _sk()
     cache.reload()
     d = Path(JOBS) / job
@@ -136,7 +136,7 @@ def render_job(job: str, relight: bool = True, feather: int = 7):
     if r.returncode:
         raise RuntimeError("generate failed:\n" + (r.stdout + r.stderr)[-2500:])
     comp = w / "composite.mp4"
-    sk.composite_over_original(w / "section.mp4", gen, w / "mask.mp4", comp, feather=feather)
+    sk.composite_over_original(w / "section.mp4", gen, w / "mask.mp4", comp, feather=feather, full_res=full_res)
     final, had_audio = sk.mux_original_audio(comp, w / "section.mp4", w / "final.mp4")
     shutil.copy(gen, d / "generated.mp4")
     shutil.copy(final, d / "final.mp4")
@@ -144,6 +144,32 @@ def render_job(job: str, relight: bool = True, feather: int = 7):
     (d / "meta.json").write_text(json.dumps(meta, indent=1))
     cache.commit()
     return (d / "final.mp4").read_bytes(), (gen).read_bytes()
+
+
+@app.function(image=image, volumes={"/cache": cache}, cpu=4, timeout=900)
+def recomposite_job(job: str, feather: int = 7):
+    """CPU only, no GPU cost: rebuild the final clip at the GENERATED size from files a finished render already saved."""
+    sk = _sk()
+    cache.reload()
+    d = Path(JOBS) / job
+    for name in ("generated.mp4", "section.mp4", "mask.mp4"):
+        if not (d / name).exists():
+            raise FileNotFoundError(f"{name} not found in job {job}; render it first.")
+    w = Path("/tmp/recomp")
+    shutil.rmtree(w, ignore_errors=True)
+    w.mkdir()
+    comp = w / "composite.mp4"
+    sk.composite_over_original(d / "section.mp4", d / "generated.mp4", d / "mask.mp4", comp, feather=feather, full_res=True)
+    final, _ = sk.mux_original_audio(comp, d / "section.mp4", w / "final_full.mp4")
+    shutil.copy(final, d / "final_full.mp4")
+    cache.commit()
+    return (d / "final_full.mp4").read_bytes()
+
+
+@app.local_entrypoint()
+def recomposite(job: str, out: str = "swap_full.mp4"):
+    Path(out).write_bytes(recomposite_job.remote(job))
+    print("Saved", out)
 
 
 @app.function(image=image, volumes={"/cache": cache}, timeout=300)
@@ -186,8 +212,8 @@ def preview(video: str, image: str, consent: str = "", resolution: str = "480p",
 
 
 @app.local_entrypoint()
-def render(job: str, out: str = "swap.mp4", relight: bool = True):
-    final, raw = render_job.remote(job, relight)
+def render(job: str, out: str = "swap.mp4", relight: bool = True, full_res: bool = False):
+    final, raw = render_job.remote(job, relight, 7, full_res)
     Path(out).write_bytes(final)
     Path(out.replace(".mp4", "_raw.mp4")).write_bytes(raw)
     print("Saved", out)

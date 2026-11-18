@@ -99,11 +99,14 @@ def source_frame_index(i, out_fps, src_frames, src_fps):
     return min(src_frames - 1, int(round(i / out_fps * src_fps - 1e-9)))
 
 
-def composite_over_original(original, generated, mask, out, feather=7):
+def composite_over_original(original, generated, mask, out, feather=7, full_res=False):
     """Paste the generated person over the ORIGINAL frames at the original size.
 
     Everything outside the (feathered) mask is the original pixels, untouched. Frames are matched by
     time, so a generated clip at another fps still lines up. Returns the number of frames written.
+
+    full_res=True writes the result at the GENERATED size instead, so the generated person keeps all
+    its detail (the original background is enlarged to match, so it is softer than the person).
     """
     info = probe(original)
     ow, oh, ofps = info["width"], info["height"], info["fps"]
@@ -112,13 +115,18 @@ def composite_over_original(original, generated, mask, out, feather=7):
     msk = list(frames(mask))
     if not (orig and gen and msk):
         raise ValueError("Empty video passed to composite.")
-    gfps = probe(generated)["fps"]
+    ginfo = probe(generated)
+    gfps = ginfo["fps"]
+    if full_res:
+        ow, oh = ginfo["width"], ginfo["height"]
     n = int(round(len(gen) / gfps * ofps))
     k = (feather * 2 + 1) | 1
     w = Writer(out, ow, oh, ofps)
     try:
         for i in range(n):
             o = orig[min(len(orig) - 1, i)]
+            if o.shape[1] != ow or o.shape[0] != oh:
+                o = cv2.resize(o, (ow, oh), interpolation=cv2.INTER_CUBIC)
             gi = min(len(gen) - 1, int(round(i / ofps * gfps - 1e-9)))
             g = cv2.resize(gen[gi], (ow, oh), interpolation=cv2.INTER_CUBIC)
             m = cv2.resize(msk[min(len(msk) - 1, gi)], (ow, oh), interpolation=cv2.INTER_LINEAR)
