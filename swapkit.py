@@ -7,6 +7,7 @@ Ideas taken from the two reference projects, re-implemented here (no code copied
     ORIGINAL soundtrack untouched on the result.
 """
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -166,6 +167,124 @@ def mask_preview(original, mask, out, color=(0, 0, 255), alpha=0.45):
     finally:
         w.close()
     return out
+
+
+def _find_yunet():
+    for p in (Path(__file__).with_name("face_detection_yunet_2023mar.onnx"),
+              Path(__file__).parent / "lora" / "face_detection_yunet_2023mar.onnx"):
+        if p.exists():
+            return p
+    return None
+
+
+def detect_face_box(bgr):
+    """Largest face as (x, y, w, h) in this frame's pixels from YuNet, or None. Profile and back-of-head views are often missed."""
+    model = _find_yunet()
+    if model is None or not hasattr(cv2, "FaceDetectorYN"):
+        raise RuntimeError("YuNet face model missing (face_detection_yunet_2023mar.onnx).")
+    k = 320 / min(bgr.shape[:2])
+    small = cv2.resize(bgr, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
+    h, w = small.shape[:2]
+    det = cv2.FaceDetectorYN.create(str(model), "", (w, h), 0.5, 0.3, 5000)
+    _, faces = det.detect(small)
+    if faces is None:
+        return None
+    f = max(faces, key=lambda r: r[2] * r[3])
+    return (float(f[0]) / k, float(f[1]) / k, float(f[2]) / k, float(f[3]) / k)
+
+
+def _median_filter(vals, window=9):
+    out, half = [], window // 2
+    for i in range(len(vals)):
+        seg = [v for v in vals[max(0, i - half): i + half + 1] if v is not None]
+        out.append(float(np.median(seg)) if seg else None)
+    return out
+
+
+def head_boxes(masks, faces):
+    """Wan's replace mask can stop at the neck: Wan prompts SAM2 with body points and then fills the mask's whole bounding
+    box, so when SAM2 leaves the head out the ORIGINAL head stays in the background video and comes back through the
+    result (found 2026-11-18: mask top 31% never marked, the original red-haired head in the head-turn frames).
+    masks: per-frame 2-D arrays (>127 = person); faces: per-frame (x, y, w, h) or None, detected on the same frames.
+    Returns per-frame (x0, y0, x1, y1) head boxes to add to the mask, directly above the mask's top edge (None = none needed).
+    Frames with a detected face use their own face; the others use the median head height seen on detected frames,
+    so profile and turned-away frames are covered too. Everything is smoothed over time."""
+    boxes = []
+    for m in masks:
+        ys, xs = np.nonzero(m > 127)
+        boxes.append(None if len(ys) == 0 else (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1))
+    ratios = []
+    for b, f in zip(boxes, faces):
+        if b is None or f is None:
+            continue
+        top = max(0.0, f[1] - 0.6 * f[3])           # room for hair above the detected face
+        if top < b[1]:
+            ratios.append((b[1] - top) / max(1, b[2] - b[0]))
+    r_med = float(np.clip(np.median(ratios), 0.15, 1.0)) if ratios else 0.5
+    tops, x0s, x1s = [], [], []
+    for b, f in zip(boxes, faces):
+        if b is None:
+            tops.append(None); x0s.append(None); x1s.append(None)
+            continue
+        w = b[2] - b[0]
+        cx = (b[0] + b[2]) / 2
+        top = b[1] - r_med * w
+        x0, x1 = cx - 0.4 * w, cx + 0.4 * w
+        if f is not None:
+            top = min(top, f[1] - 0.6 * f[3]) if f[1] - 0.6 * f[3] < b[1] else b[1]
+            x0, x1 = min(x0, f[0] - 0.45 * f[2]), max(x1, f[0] + 1.45 * f[2])
+        tops.append(top); x0s.append(x0); x1s.append(x1)
+    tops, x0s, x1s = _median_filter(tops), _median_filter(x0s), _median_filter(x1s)
+    out = []
+    for b, t, a, z, f in zip(boxes, tops, x0s, x1s, faces):
+        if b is None or t is None:
+            out.append(None)
+            continue
+        if f is not None:                         # the detected face must never be left out by smoothing
+            t = min(t, f[1] - 0.6 * f[3]) if f[1] - 0.6 * f[3] < b[1] else t
+            a, z = min(a, f[0] - 0.45 * f[2]), max(z, f[0] + 1.45 * f[2])
+        t = max(0.0, t - 0.05 * (b[2] - b[0]))     # small safety margin above the hair
+        if t >= b[1]:
+            out.append(None)
+            continue
+        out.append((int(max(0, a)), int(t), int(min(masks[0].shape[1], z)), b[1]))
+    return out
+
+
+def cover_head_files(proc_dir, face_fn=None):
+    """Rebuild Wan's src_mask.mp4 and src_bg.mp4 in proc_dir with the head inside the mask. Faces are detected on the
+    background video (the head is still visible there when the mask misses it). The old files are kept as *_nohead.mp4.
+    Returns stats: frames, frames with a detected face, median head ratio, frames extended."""
+    proc = Path(proc_dir)
+    face_fn = face_fn or detect_face_box
+    bg_p, mk_p = proc / "src_bg.mp4", proc / "src_mask.mp4"
+    bg, mk = list(frames(bg_p)), list(frames(mk_p))
+    if not bg or len(bg) != len(mk):
+        raise ValueError(f"Background and mask videos differ in length ({len(bg)} vs {len(mk)} frames).")
+    gray = [f.max(axis=2) for f in mk]
+    faces = [face_fn(f) for f in bg]
+    boxes = head_boxes(gray, faces)
+    info = probe(mk_p)
+    shutil.copy(bg_p, proc / "src_bg_nohead.mp4")
+    shutil.copy(mk_p, proc / "src_mask_nohead.mp4")
+    wb = Writer(bg_p, info["width"], info["height"], info["fps"])
+    wm = Writer(mk_p, info["width"], info["height"], info["fps"])
+    try:
+        for f, g, b in zip(bg, gray, boxes):
+            g = g.copy()
+            f = f.copy()
+            if b is not None:
+                x0, y0, x1, y1 = b
+                g[y0:y1, x0:x1] = 255
+                f[y0:y1, x0:x1] = 0
+            wm.put(np.repeat(g[..., None], 3, axis=2))
+            wb.put(f)
+    finally:
+        wb.close()
+        wm.close()
+    detected = sum(1 for f in faces if f is not None)
+    return {"frames": len(bg), "faces_detected": detected, "frames_extended": sum(1 for b in boxes if b is not None),
+            "mean_extension_px": float(np.mean([b[3] - b[1] for b in boxes if b is not None])) if any(boxes) else 0.0}
 
 
 def mask_stats(mask):

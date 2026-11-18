@@ -138,3 +138,56 @@ def test_composite_default_never_lets_original_pixels_through_at_any_size(tmp_pa
     sk.composite_over_original(orig, gen, msk, out, feather=7)
     f = next(sk.frames(out))
     assert f[2, 2, 0] > 150 and f[2, 2, 2] < 80   # a pixel OUTSIDE the mask is the generated colour
+
+
+def _mask_below_head(h=200, w=120, top=100, n=30):
+    """Wan-style mask: a box from the neck down (the head, above it, is NOT in the mask)."""
+    m = np.zeros((h, w), np.uint8)
+    m[top:h - 10, 30:90] = 255
+    return [m.copy() for _ in range(n)]
+
+
+def test_head_boxes_cover_every_detected_face_and_fill_undetected_frames():
+    masks = _mask_below_head()
+    face = (45.0, 62.0, 30.0, 34.0)                      # a face just above the mask top (y=100)
+    faces = [face if i % 3 else None for i in range(len(masks))]    # a third of the frames have no detection (e.g. profile)
+    boxes = sk.head_boxes(masks, faces)
+    for i, (b, f) in enumerate(zip(boxes, faces)):
+        assert b is not None
+        x0, y0, x1, y1 = b
+        assert y1 == 100 and y0 >= 0 and x1 <= 120
+        if f is not None:                                # the whole face, plus hair room, is inside the new box
+            assert x0 <= f[0] and x1 >= f[0] + f[2] and y0 <= f[1] - 0.5 * f[3]
+        else:                                            # undetected frame: still extended upward by the typical head height
+            assert y1 - y0 > 20
+
+
+def test_head_boxes_leave_a_mask_that_already_has_the_head():
+    masks = _mask_below_head(top=40)
+    faces = [(45.0, 55.0, 30.0, 34.0)] * len(masks)       # face is inside the mask already
+    assert all(b is None or b[3] - b[1] <= 0.17 * 60 + 6 for b in sk.head_boxes(masks, faces))
+
+
+def test_head_boxes_empty_mask_frame_is_none():
+    masks = _mask_below_head(n=5)
+    masks[2][:] = 0
+    assert sk.head_boxes(masks, [None] * 5)[2] is None
+
+
+def test_cover_head_files_moves_the_head_out_of_the_background(tmp_path):
+    w, h, n = 120, 200, 12
+    mk = sk.Writer(tmp_path / "src_mask.mp4", w, h, 30)
+    bg = sk.Writer(tmp_path / "src_bg.mp4", w, h, 30)
+    for _ in range(n):
+        m = np.zeros((h, w, 3), np.uint8); m[100:190, 30:90] = 255
+        f = np.full((h, w, 3), 90, np.uint8); f[100:190, 30:90] = 0
+        cv2.circle(f, (60, 80), 18, (40, 60, 220), -1)   # the head, visible in the background because the mask misses it
+        mk.put(m); bg.put(f)
+    mk.close(); bg.close()
+    st = sk.cover_head_files(tmp_path, face_fn=lambda fr: (45.0, 62.0, 30.0, 34.0))
+    assert st["frames"] == n and st["faces_detected"] == n and st["frames_extended"] == n
+    m0 = next(sk.frames(tmp_path / "src_mask.mp4")).max(axis=2)
+    b0 = next(sk.frames(tmp_path / "src_bg.mp4"))
+    assert (m0[65:98, 48:72] > 200).all()                # head area is now inside the mask
+    assert b0[80, 60].max() < 40                         # and the original head is gone from the background
+    assert (tmp_path / "src_mask_nohead.mp4").exists() and (tmp_path / "src_bg_nohead.mp4").exists()

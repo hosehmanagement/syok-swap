@@ -48,6 +48,7 @@ image = (
     # from source). Use the official prebuilt wheel that matches torch 2.6 / CUDA 12 / python 3.11.
     .run_commands("pip install 'https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl' && python -c \"import importlib.metadata as m; print('flash_attn', m.version('flash_attn'))\"")
     .add_local_file(Path(__file__).parent / "swapkit.py", "/opt/swapkit.py")
+    .add_local_file(Path(__file__).parent / "lora" / "face_detection_yunet_2023mar.onnx", "/opt/face_detection_yunet_2023mar.onnx")  # head detection for the mask
     .add_local_python_source("lora")   # lora/merge.py: merge an identity LoRA into the base weights at render time
 )
 
@@ -92,10 +93,12 @@ def make_preview(video: bytes, photo: bytes, photo_ext: str, resolution: str, ma
         cwd=pre, capture_output=True, text=True)
     if r.returncode:
         raise RuntimeError("preprocess failed:\n" + (r.stdout + r.stderr)[-2500:])
+    # Wan's mask can leave the head out (SAM2 body points + a bounding box), which keeps the ORIGINAL head in the background
+    head = sk.cover_head_files(d / "proc")
     mask, inverted = sk.normalize_mask(d / "proc" / "src_mask.mp4", d / "mask.mp4")
     stats = sk.mask_stats(mask)
     sk.mask_preview(sec, mask, d / "preview.mp4")
-    meta = {"job": job, "section": [s, l], "resolution": resolution, "margin": margin, "mask_inverted": inverted, "stats": stats}
+    meta = {"job": job, "section": [s, l], "resolution": resolution, "margin": margin, "mask_inverted": inverted, "stats": stats, "head": head}
     (d / "meta.json").write_text(json.dumps(meta, indent=1))
     cache.commit()
     return meta, (d / "preview.mp4").read_bytes()
