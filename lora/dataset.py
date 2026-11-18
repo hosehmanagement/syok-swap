@@ -77,8 +77,33 @@ def ahash(bgr, n=8):
     return (g > g.mean()).flatten()
 
 
+YUNET = Path(__file__).with_name("face_detection_yunet_2023mar.onnx")  # opencv_zoo YuNet, MIT licence, 233 KB
+
+
+def _yunet_fraction(bgr):
+    """Face width / short side from YuNet on a 320-px-short-side copy (it misses faces that fill a big frame). None if unavailable."""
+    if not YUNET.exists() or not hasattr(cv2, "FaceDetectorYN"):
+        return None
+    k = 320 / min(bgr.shape[:2])
+    small = cv2.resize(bgr, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
+    h, w = small.shape[:2]
+    det = cv2.FaceDetectorYN.create(str(YUNET), "", (w, h), 0.5, 0.3, 5000)
+    _, faces = det.detect(small)
+    return 0.0 if faces is None else max(float(f[2]) for f in faces) / min(h, w)
+
+
 def face_fraction(bgr):
-    """Largest frontal-or-profile face width as a fraction of the short side (0 if none)."""
+    """Largest face width as a fraction of the short side (0 if none).
+
+    YuNet first: it handles 3/4 and turned heads, which the Haar cascades miss (found 2026-11-18: Haar scored 0.0 on
+    plainly visible 3/4 portraits). Haar frontal+profile (also mirrored) is the fallback if the model file is absent."""
+    y = _yunet_fraction(bgr)
+    if y is not None:
+        return y
+    short0 = min(bgr.shape[:2])
+    if short0 > 512:
+        k = 512 / short0
+        bgr = cv2.resize(bgr, (round(bgr.shape[1] * k), round(bgr.shape[0] * k)), interpolation=cv2.INTER_AREA)
     g = cv2.equalizeHist(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))
     short = min(g.shape)
     ms = (max(24, short // 12),) * 2
@@ -87,8 +112,9 @@ def face_fraction(bgr):
         c = cv2.CascadeClassifier(cv2.data.haarcascades + name)
         if c.empty():
             raise RuntimeError(f"OpenCV face cascade missing ({name}); install opencv-python-headless<5")
-        for (x, y, w, h) in c.detectMultiScale(g, 1.1, 5, minSize=ms):
-            best = max(best, w)
+        for img in (g, cv2.flip(g, 1)):
+            for (x, y2, w, h) in c.detectMultiScale(img, 1.1, 5, minSize=ms):
+                best = max(best, w)
     return best / short
 
 
