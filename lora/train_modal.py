@@ -59,9 +59,11 @@ def doctor():
         if not Path("/opt/musubi", script).exists():
             problems.append(f"missing script {script}")
             continue
-        miss = C.flags_missing(_help(script), flags)
+        h = _help(script)
+        miss = C.flags_missing(h, flags)
         if miss:
             problems.append(f"{script}: unknown flags {miss}")
+            print(f"--- raw `--help` output for {script} (last 700 chars) ---\n{h[-700:]}\n---")
     anim = subprocess.run("grep -ril animate /opt/musubi/src /opt/musubi/docs | head -5", shell=True, capture_output=True, text=True).stdout
     print("musubi commit:", commit)
     print("mentions of 'animate' in musubi (training the Animate checkpoint directly):", anim.strip() or "none")
