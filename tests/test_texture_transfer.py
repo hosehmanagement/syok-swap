@@ -88,3 +88,19 @@ def test_process_video_refuses_when_no_face(tmp_path):
     ref = tmp_path / "r.png"; cv2.imwrite(str(ref), np.full((64, 64, 3), 120, np.uint8))
     with pytest.raises(ValueError):
         tt.process_video(src, ref, tmp_path / "o.mp4", detector=lambda f: (None, 0.0))
+
+
+def test_box_is_skin_rejects_blue_window_accepts_skin():
+    import numpy as np
+    import texture_transfer as tt
+    win = np.zeros((100, 100, 3), np.uint8); win[...] = (160, 90, 30)       # bluish (BGR)
+    skin = np.zeros((100, 100, 3), np.uint8); skin[...] = (120, 150, 200)   # skin-ish (BGR)
+    assert not tt.box_is_skin(win, (10, 10, 80, 80))
+    assert tt.box_is_skin(skin, (10, 10, 80, 80))
+
+
+def test_reject_outliers_drops_tiny_false_box():
+    import texture_transfer as tt
+    dets = [((0, 0, 200, 200), 1.0)] * 6 + [((5, 5, 40, 40), 1.0), (None, 0.0)]
+    out = tt.reject_outliers(dets)
+    assert out[6] == (None, 0.0) and out[0][0] == (0, 0, 200, 200) and out[7] == (None, 0.0)

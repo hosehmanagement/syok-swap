@@ -94,6 +94,29 @@ def _cascade(name):
     return _CASC[name]
 
 
+MIN_SKIN = 0.35
+
+
+def box_is_skin(frame_bgr, box, min_skin=MIN_SKIN):
+    """True when the middle of the box is mostly skin coloured (rejects windows, hair, cloth)."""
+    x, y, w, h = [int(v) for v in box]
+    H, W = frame_bgr.shape[:2]
+    x0, y0 = max(0, x + w // 4), max(0, y + h // 4)
+    x1, y1 = min(W, x + 3 * w // 4), min(H, y + 3 * h // 4)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return False
+    return float(skin_prob(frame_bgr[y0:y1, x0:x1]).mean()) >= min_skin
+
+
+def reject_outliers(dets, lo=0.4, hi=2.5):
+    """Drop boxes whose area is far from the clip's median box area (single-frame false hits)."""
+    areas = [b[2] * b[3] for b, _ in dets if b is not None]
+    if len(areas) < 3:
+        return list(dets)
+    med = float(np.median(areas))
+    return [(b, w) if b is not None and lo * med <= b[2] * b[3] <= hi * med else (None, 0.0) for b, w in dets]
+
+
 def detect_face(frame_bgr):
     """Return ((x, y, w, h), weight) or (None, 0). Weight 1.0 frontal, 0.7 profile."""
     g = cv2.equalizeHist(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY))
@@ -101,12 +124,14 @@ def detect_face(frame_bgr):
     ms = (max(24, min(H, W) // 10),) * 2
     for name in ("haarcascade_frontalface_alt2.xml", "haarcascade_frontalface_default.xml"):
         f = _cascade(name).detectMultiScale(g, 1.1, 5, minSize=ms)
+        f = [b for b in f if box_is_skin(frame_bgr, b)]
         if len(f):
             return tuple(max(f, key=lambda b: b[2] * b[3])), 1.0
     prof = _cascade("haarcascade_profileface.xml")
     cands = [tuple(b) for b in prof.detectMultiScale(g, 1.1, 4, minSize=ms)]
     gm = cv2.flip(g, 1)
     cands += [(W - b[0] - b[2], b[1], b[2], b[3]) for b in prof.detectMultiScale(gm, 1.1, 4, minSize=ms)]
+    cands = [b for b in cands if box_is_skin(frame_bgr, b)]
     if cands:
         return max(cands, key=lambda b: b[2] * b[3]), 0.7
     return None, 0.0
@@ -157,7 +182,7 @@ def process_video(src, ref_path, out, strength=1.0, sigma_frac=0.010, detector=d
     info = sk.probe(src)
     frames = list(sk.frames(src))
     dets = [detector(f) for f in frames]
-    tracks = smooth_tracks(dets)
+    tracks = smooth_tracks(reject_outliers(dets))
     widths = [b[2] for b, w in tracks if b is not None and w >= 0.7]
     if not widths:
         raise ValueError("No face tracked in the clip; nothing to do.")
