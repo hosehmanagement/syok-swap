@@ -99,7 +99,7 @@ def source_frame_index(i, out_fps, src_frames, src_fps):
     return min(src_frames - 1, int(round(i / out_fps * src_fps - 1e-9)))
 
 
-def composite_over_original(original, generated, mask, out, feather=7, full_res=False):
+def composite_over_original(original, generated, mask, out, feather=7, full_res=False, blend_original=None):
     """Paste the generated person over the ORIGINAL frames at the original size.
 
     Everything outside the (feathered) mask is the original pixels, untouched. Frames are matched by
@@ -107,7 +107,15 @@ def composite_over_original(original, generated, mask, out, feather=7, full_res=
 
     full_res=True writes the result at the GENERATED size instead, so the generated person keeps all
     its detail (the original background is enlarged to match, so it is softer than the person).
+
+    blend_original: default True normally, False when full_res. The mask is a coarse region, not a person silhouette
+    (on the 720p job the top ~31% of the frame was never masked), so original pixels outside it can be the ORIGINAL
+    PERSON's head: found 2026-11-18, the original red-haired head came back through the composite in the head-turn
+    frames (100-118) while the raw generation was correct. At full size the enlarged original is softer than the
+    generated frame anyway, so full_res uses the generated frames as they are.
     """
+    if blend_original is None:
+        blend_original = not full_res
     info = probe(original)
     ow, oh, ofps = info["width"], info["height"], info["fps"]
     orig = list(frames(original))
@@ -132,7 +140,9 @@ def composite_over_original(original, generated, mask, out, feather=7, full_res=
             m = cv2.resize(msk[min(len(msk) - 1, gi)], (ow, oh), interpolation=cv2.INTER_LINEAR)
             m = (m.max(axis=2) if m.ndim == 3 else m).astype(np.float32) / 255.0
             m = (m > 0.5).astype(np.float32)
-            if feather:
+            if not blend_original:
+                m = np.ones_like(m)
+            if feather and blend_original:
                 m = cv2.GaussianBlur(m, (k, k), 0)
             m = m[..., None]
             w.put(o.astype(np.float32) * (1 - m) + g.astype(np.float32) * m)

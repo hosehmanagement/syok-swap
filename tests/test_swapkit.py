@@ -109,9 +109,22 @@ def test_composite_full_res_uses_generated_size_and_keeps_detail(tmp_path):
     gen = make_video(tmp_path / "g.mp4", (200, 10, 10), n=24, fps=24, w=128, h=96)
     msk = make_video(tmp_path / "m.mp4", (0, 0, 0), n=24, fps=24, w=128, h=96, box=(40, 30, 88, 66))
     out = tmp_path / "c.mp4"
-    n = sk.composite_over_original(orig, gen, msk, out, feather=0, full_res=True)
+    n = sk.composite_over_original(orig, gen, msk, out, feather=0, full_res=True, blend_original=True)
     info = sk.probe(out)
     assert n == 24 and (info["width"], info["height"]) == (128, 96)
     f = next(sk.frames(out))
     assert f[48, 64, 0] > 150 and f[48, 64, 2] < 80          # centre is the generated colour
     assert f[3, 3, 1] > 150                                 # background is the (enlarged) original
+
+
+def test_composite_full_res_default_never_lets_original_pixels_through(tmp_path):
+    """Regression (2026-11-18): the mask was a coarse region, so the original person's head came back through the
+    composite in head-turn frames. At full size the generated frame is used as it is, even where the mask is 0."""
+    orig = make_video(tmp_path / "o.mp4", (10, 200, 10), n=24, fps=24, w=64, h=48)
+    gen = make_video(tmp_path / "g.mp4", (200, 10, 10), n=24, fps=24, w=128, h=96)
+    msk = make_video(tmp_path / "m.mp4", (0, 0, 0), n=24, fps=24, w=128, h=96, box=(40, 30, 88, 66))
+    out = tmp_path / "c.mp4"
+    sk.composite_over_original(orig, gen, msk, out, feather=7, full_res=True)
+    f = next(sk.frames(out))
+    assert f[3, 3, 0] > 150 and f[3, 3, 1] < 80             # corner is generated red, not original green
+    assert f[90, 120, 0] > 150 and f[90, 120, 1] < 80
