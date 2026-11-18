@@ -34,6 +34,7 @@ image = (
     .pip_install("torch==2.6.0", "torchvision==0.21.0", "huggingface_hub[hf_transfer]")
     .run_commands(f"git clone {MUSUBI_REPO} /opt/musubi && cd /opt/musubi && git checkout {MUSUBI_REF} && pip install -e . && git rev-parse HEAD")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    .add_local_python_source("lora")   # ship our own package; without this the container fails with "No module named 'lora'"
 )
 
 FILES = [  # (repo, path in repo, local name) verified present on the Hub on 2026-11-18
