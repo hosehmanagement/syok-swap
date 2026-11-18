@@ -37,7 +37,7 @@ def test_composite_keeps_background_exact_and_fps_remap(tmp_path):
     gen = make_video(tmp_path / "g.mp4", (200, 10, 10), n=15, fps=15, w=32, h=24)  # other size AND fps
     msk = make_video(tmp_path / "m.mp4", (0, 0, 0), n=15, fps=15, w=32, h=24, box=(12, 8, 20, 16))
     out = tmp_path / "c.mp4"
-    n = sk.composite_over_original(orig, gen, msk, out, feather=0)
+    n = sk.composite_over_original(orig, gen, msk, out, feather=0, blend_original=True)
     assert n == 24
     info = sk.probe(out)
     assert (info["width"], info["height"]) == (64, 48)
@@ -128,3 +128,13 @@ def test_composite_full_res_default_never_lets_original_pixels_through(tmp_path)
     f = next(sk.frames(out))
     assert f[3, 3, 0] > 150 and f[3, 3, 1] < 80             # corner is generated red, not original green
     assert f[90, 120, 0] > 150 and f[90, 120, 1] < 80
+
+
+def test_composite_default_never_lets_original_pixels_through_at_any_size(tmp_path):
+    orig = make_video(tmp_path / "o.mp4", (30, 60, 90), n=6, fps=24)
+    gen = make_video(tmp_path / "g.mp4", (200, 10, 10), n=6, fps=24)
+    msk = make_video(tmp_path / "m.mp4", (0, 0, 0), n=6, fps=24, box=(24, 16, 40, 32))
+    out = tmp_path / "c.mp4"
+    sk.composite_over_original(orig, gen, msk, out, feather=7)
+    f = next(sk.frames(out))
+    assert f[2, 2, 0] > 150 and f[2, 2, 2] < 80   # a pixel OUTSIDE the mask is the generated colour

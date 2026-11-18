@@ -108,14 +108,14 @@ def composite_over_original(original, generated, mask, out, feather=7, full_res=
     full_res=True writes the result at the GENERATED size instead, so the generated person keeps all
     its detail (the original background is enlarged to match, so it is softer than the person).
 
-    blend_original: default True normally, False when full_res. The mask is a coarse region, not a person silhouette
+    blend_original: default False at every size (2026-11-18: final.mp4 at 448x768 showed the same bug). The mask is a coarse region, not a person silhouette
     (on the 720p job the top ~31% of the frame was never masked), so original pixels outside it can be the ORIGINAL
     PERSON's head: found 2026-11-18, the original red-haired head came back through the composite in the head-turn
     frames (100-118) while the raw generation was correct. At full size the enlarged original is softer than the
-    generated frame anyway, so full_res uses the generated frames as they are.
+    generated frame anyway, so the generated frames are used as they are; pass blend_original=True to opt back in.
     """
     if blend_original is None:
-        blend_original = not full_res
+        blend_original = False
     info = probe(original)
     ow, oh, ofps = info["width"], info["height"], info["fps"]
     orig = list(frames(original))
