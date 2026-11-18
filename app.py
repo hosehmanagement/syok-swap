@@ -48,6 +48,7 @@ image = (
     # from source). Use the official prebuilt wheel that matches torch 2.6 / CUDA 12 / python 3.11.
     .run_commands("pip install 'https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl' && python -c \"import importlib.metadata as m; print('flash_attn', m.version('flash_attn'))\"")
     .add_local_file(Path(__file__).parent / "swapkit.py", "/opt/swapkit.py")
+    .add_local_python_source("lora")   # lora/merge.py: merge an identity LoRA into the base weights at render time
 )
 
 
@@ -101,7 +102,7 @@ def make_preview(video: bytes, photo: bytes, photo_ext: str, resolution: str, ma
 
 
 @app.function(image=image, gpu="H100", volumes={"/cache": cache}, timeout=3600)
-def render_job(job: str, relight: bool = True, feather: int = 7, full_res: bool = False):
+def render_job(job: str, relight: bool = True, feather: int = 7, full_res: bool = False, lora: str = "", lora_strength: float = 1.0):
     sk = _sk()
     cache.reload()
     d = Path(JOBS) / job
@@ -132,7 +133,13 @@ def render_job(job: str, relight: bool = True, feather: int = 7, full_res: bool 
            "--src_root_path", str(w / "proc"), "--refert_num", "1", "--replace_flag", "--save_file", str(gen)]
     if relight:
         cmd.append("--use_relighting_lora")
-    r = subprocess.run(cmd, cwd="/opt/wan", capture_output=True, text=True)
+    env = dict(os.environ)
+    if lora:                                       # path of a .safetensors LoRA on the volume, e.g. /cache/loras/me_low.safetensors
+        from lora.merge import patch_animate_source
+        src = Path("/opt/wan/wan/animate.py")
+        src.write_text(patch_animate_source(src.read_text()))
+        env.update(SYOK_LORA=lora, SYOK_LORA_STRENGTH=str(lora_strength))
+    r = subprocess.run(cmd, cwd="/opt/wan", capture_output=True, text=True, env=env)
     if r.returncode:
         raise RuntimeError("generate failed:\n" + (r.stdout + r.stderr)[-2500:])
     comp = w / "composite.mp4"
@@ -212,8 +219,8 @@ def preview(video: str, image: str, consent: str = "", resolution: str = "480p",
 
 
 @app.local_entrypoint()
-def render(job: str, out: str = "swap.mp4", relight: bool = True, full_res: bool = False):
-    final, raw = render_job.remote(job, relight, 7, full_res)
+def render(job: str, out: str = "swap.mp4", relight: bool = True, full_res: bool = False, lora: str = "", lora_strength: float = 1.0):
+    final, raw = render_job.remote(job, relight, 7, full_res, lora, lora_strength)
     Path(out).write_bytes(final)
     Path(out.replace(".mp4", "_raw.mp4")).write_bytes(raw)
     print("Saved", out)

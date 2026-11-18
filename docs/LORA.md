@@ -12,12 +12,16 @@ Goal: a LoRA for the person's face that keeps pores and stubble, trained with ca
 Tested on CPU (tests/test_lora.py): consent binding, quality gates, captions, toml, command lines, step cap.
 NOT tested: anything on Modal. `doctor` exists to catch wrong flag names for the installed musubi version for cents instead of GPU hours.
 
-## Unverified (do not assume)
-- That a LoRA trained on the T2V low-noise model loads into, and helps, **Wan2.2-Animate-14B** (our swap engine). Only the relight LoRA is known to load there. Musubi may not train the Animate checkpoint directly; `doctor` greps for it. A ComfyUI-format Animate file exists (wan2.2_animate_14B_bf16.safetensors).
-- The settings (rank 16, lr 1e-4, shift 1.0, steps 600) come from community reports (musubi discussion #455), not from tests on this project.
-- Musubi is pinned to f8a1b037 (2026-11-18). `doctor` passed: every flag we use appears in its source. That checks names only, not that training works. Its `--help` crashes without a GPU, so flags are read from source.
-- Musubi has no Animate support (no mention in its source), so a T2V-trained LoRA cannot be tested or trained on the Animate checkpoint with it.
-- Photos-only training may not teach motion; the low-noise expert is trained alone.
+## Verified on 2026-11-18 (from real file headers, no GPU)
+- All 400 attention/FFN linear layers of Wan2.2-T2V-A14B (low noise) exist in Wan2.2-Animate-14B with identical names and shapes; Animate only adds k_img/v_img and a face adapter. A musubi-style LoRA trained on T2V low-noise maps onto the ORIGINAL Wan Animate checkpoint: 400 of 400 modules, 0 unmatched (checked against its real 1441-weight index). Same check on the relight LoRA: 480 of 480.
+- Wan's Animate loader accepts one PEFT adapter (rank 128), used by the relight LoRA, so the identity LoRA is MERGED into the base weights (lora/merge.py, tested: math, three key styles, dtype, refuses a wrong base model). `modal run app.py::render --job X --lora /cache/loras/me_low.safetensors --lora-strength 1.0` patches Wan's animate.py (patch tested against the real file at the pinned commit) so the merge happens before the relight LoRA loads.
+- musubi-tuner pinned to f8a1b037; `doctor` passed (flag names exist in its source). Its `--help` needs a GPU, so flags are read from source.
+
+## Still unverified (needs a paid training run, est. up to ~$3.95)
+- That the merged LoRA actually makes the swapped face look better (pores/stubble) rather than worse or changing identity. Compatibility is proven; benefit is not.
+- Musubi cannot train the Animate checkpoint itself (no Animate support), so the LoRA is trained on T2V low-noise and merged; strength needs tuning.
+- Training settings (rank 16, lr 1e-4, shift 1.0, 600 steps) are community starting points.
+- Photos-only training may not teach motion; only the low-noise expert is trained.
 
 ## Cost
 Hard 1 h cap on an H100 (est. about $3.95, check Modal's price page). Not run yet.
