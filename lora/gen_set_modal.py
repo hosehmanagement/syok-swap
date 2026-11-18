@@ -44,7 +44,7 @@ vol = modal.Volume.from_name("syok-lora-data", create_if_missing=True)
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("torch==2.6.0", "transformers", "accelerate", "sentencepiece", "pillow", "huggingface_hub[hf_transfer]",
-                 "git+https://github.com/huggingface/diffusers")
+                 "diffusers>=0.36")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
 )
 
