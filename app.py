@@ -94,7 +94,7 @@ def make_preview(video: bytes, photo: bytes, photo_ext: str, resolution: str, ma
     if r.returncode:
         raise RuntimeError("preprocess failed:\n" + (r.stdout + r.stderr)[-2500:])
     # Wan's mask can leave the head out (SAM2 body points + a bounding box), which keeps the ORIGINAL head in the background
-    head = sk.cover_head_files(d / "proc")
+    head = sk.cover_head_files(d / "proc", sec)
     mask, inverted = sk.normalize_mask(d / "proc" / "src_mask.mp4", d / "mask.mp4")
     stats = sk.mask_stats(mask)
     sk.mask_preview(sec, mask, d / "preview.mp4")

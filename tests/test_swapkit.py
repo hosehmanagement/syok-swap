@@ -163,28 +163,36 @@ def test_head_boxes_cover_every_detected_face_and_fill_undetected_frames():
 
 
 def test_head_boxes_leave_a_mask_that_already_has_the_head():
-    masks = _mask_below_head(top=40)
-    faces = [(45.0, 55.0, 30.0, 34.0)] * len(masks)       # face is inside the mask already
-    assert all(b is None or b[3] - b[1] <= 0.17 * 60 + 6 for b in sk.head_boxes(masks, faces))
+    masks = _mask_below_head(top=20)
+    faces = [(45.0, 60.0, 30.0, 34.0)] * len(masks)       # face and its hair room sit inside the mask already
+    assert all(b is None for b in sk.head_boxes(masks, faces))
 
 
 def test_head_boxes_empty_mask_frame_is_none():
     masks = _mask_below_head(n=5)
     masks[2][:] = 0
-    assert sk.head_boxes(masks, [None] * 5)[2] is None
+    assert sk.head_boxes(masks, [(45.0, 62.0, 30.0, 34.0)] * 5)[2] is None
+
+
+def test_head_boxes_refuse_to_guess_without_any_face():
+    with pytest.raises(ValueError):
+        sk.head_boxes(_mask_below_head(n=5), [None] * 5)
 
 
 def test_cover_head_files_moves_the_head_out_of_the_background(tmp_path):
     w, h, n = 120, 200, 12
     mk = sk.Writer(tmp_path / "src_mask.mp4", w, h, 30)
     bg = sk.Writer(tmp_path / "src_bg.mp4", w, h, 30)
-    for _ in range(n):
+    sec = sk.Writer(tmp_path / "section.mp4", w * 2, h * 2, 24)      # other size AND fps than the mask
+    for i in range(n):
         m = np.zeros((h, w, 3), np.uint8); m[100:190, 30:90] = 255
         f = np.full((h, w, 3), 90, np.uint8); f[100:190, 30:90] = 0
         cv2.circle(f, (60, 80), 18, (40, 60, 220), -1)   # the head, visible in the background because the mask misses it
         mk.put(m); bg.put(f)
-    mk.close(); bg.close()
-    st = sk.cover_head_files(tmp_path, face_fn=lambda fr: (45.0, 62.0, 30.0, 34.0))
+    for i in range(10):
+        sec.put(np.full((h * 2, w * 2, 3), 90, np.uint8))
+    mk.close(); bg.close(); sec.close()
+    st = sk.cover_head_files(tmp_path, tmp_path / "section.mp4", face_fn=lambda fr: (90.0, 124.0, 60.0, 68.0))   # section pixels
     assert st["frames"] == n and st["faces_detected"] == n and st["frames_extended"] == n
     m0 = next(sk.frames(tmp_path / "src_mask.mp4")).max(axis=2)
     b0 = next(sk.frames(tmp_path / "src_bg.mp4"))
