@@ -45,9 +45,10 @@ FILES = [  # (repo, path in repo, local name) verified present on the Hub on 202
 HIGH = ("Comfy-Org/Wan_2.2_ComfyUI_Repackaged", "split_files/diffusion_models/wan2.2_t2v_high_noise_14B_fp16.safetensors", "wan2.2_t2v_high_noise_14B_fp16.safetensors")
 
 
-def _help(script):
-    r = subprocess.run(["python", script, "--help"], cwd="/opt/musubi", capture_output=True, text=True)
-    return r.stdout + r.stderr
+def _source_text():
+    """All musubi python source in one string. `--help` cannot be used: musubi touches the GPU on import, so it
+    crashes on a CPU container (found on 2026-11-18). A flag declared via add_argument appears quoted in the source."""
+    return "\n".join(p.read_text(errors="ignore") for p in Path("/opt/musubi/src").rglob("*.py"))
 
 
 @app.function(image=image, cpu=2, timeout=900)
@@ -55,15 +56,14 @@ def doctor():
     """Cheap pre-flight: commit in use, scripts exist, and every flag we pass is accepted by this musubi version."""
     commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd="/opt/musubi", capture_output=True, text=True).stdout.strip()
     problems = []
+    src = _source_text()
     for script, flags in ((C.CACHE_LATENTS, C.FLAGS_CACHE_LATENTS), (C.CACHE_TEXT, C.FLAGS_CACHE_TEXT), (C.TRAINER, C.FLAGS_TRAIN)):
         if not Path("/opt/musubi", script).exists():
             problems.append(f"missing script {script}")
             continue
-        h = _help(script)
-        miss = C.flags_missing(h, flags)
+        miss = [f for f in flags if f'"{f}"' not in src and f"'{f}'" not in src]
         if miss:
-            problems.append(f"{script}: unknown flags {miss}")
-            print(f"--- raw `--help` output for {script} (last 700 chars) ---\n{h[-700:]}\n---")
+            problems.append(f"{script}: flags not found in musubi source {miss}")
     anim = subprocess.run("grep -ril animate /opt/musubi/src /opt/musubi/docs | head -5", shell=True, capture_output=True, text=True).stdout
     print("musubi commit:", commit)
     print("mentions of 'animate' in musubi (training the Animate checkpoint directly):", anim.strip() or "none")
