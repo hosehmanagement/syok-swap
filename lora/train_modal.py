@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lora import commands as C  # noqa: E402
 
 MUSUBI_REPO = "https://github.com/kohya-ss/musubi-tuner"
-MUSUBI_REF = "main"    # NOT PINNED YET: `doctor` prints the commit; copy it here once the flags check passes
+MUSUBI_REF = "f8a1b03794a49239a3539015075f5123d6c07d66"  # pinned 2026-11-18 after `doctor` passed (flags found in source)
 VOL = "/data"
 MODELS = f"{VOL}/models"
 TIMEOUT_S = 3600
