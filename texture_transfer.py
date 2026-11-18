@@ -49,6 +49,17 @@ def make_detail_layer(ref_bgr, ref_box, size_wh, sigma_frac=0.010, clip_mult=2.5
     sigma = max(1.0, sigma_frac * size_wh[0])
     hf = y_ch - cv2.GaussianBlur(y_ch, (0, 0), sigma)
     hf *= sk_mask
+    # keep real texture, drop copied outlines: attenuate near large-scale edges (jaw, hair line, ear) of the reference
+    coarse = cv2.GaussianBlur(y_ch, (0, 0), sigma * 3.0)
+    gx, gy = cv2.Sobel(coarse, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(coarse, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.GaussianBlur(np.hypot(gx, gy), (0, 0), sigma * 2.0)
+    g0 = 2.0 * float(np.median(mag[sk_mask > 0.5])) + 1e-3 if (sk_mask > 0.5).any() else float(mag.mean()) + 1e-3
+    hf *= 1.0 / (1.0 + (mag / g0) ** 4)
+    # feather the borders so the crop edge can never draw a line
+    hh, ww = hf.shape
+    fy = np.clip(np.minimum(np.arange(hh), hh - 1 - np.arange(hh)) / (0.10 * hh), 0, 1)
+    fx = np.clip(np.minimum(np.arange(ww), ww - 1 - np.arange(ww)) / (0.10 * ww), 0, 1)
+    hf *= np.outer(fy, fx).astype(np.float32)
     sd = float(hf[sk_mask > 0.5].std()) if (sk_mask > 0.5).any() else float(hf.std())
     if sd < 1e-6:
         return np.zeros_like(hf)

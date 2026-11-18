@@ -104,3 +104,20 @@ def test_reject_outliers_drops_tiny_false_box():
     dets = [((0, 0, 200, 200), 1.0)] * 6 + [((5, 5, 40, 40), 1.0), (None, 0.0)]
     out = tt.reject_outliers(dets)
     assert out[6] == (None, 0.0) and out[0][0] == (0, 0, 200, 200) and out[7] == (None, 0.0)
+
+
+def test_detail_layer_suppresses_large_edge_keeps_texture():
+    import numpy as np
+    import texture_transfer as tt
+    rng = np.random.default_rng(1)
+    img = np.zeros((300, 300, 3), np.uint8)
+    img[...] = (120, 150, 200)
+    img[:, 150:] = (60, 80, 110)                         # strong vertical outline (still skin-coloured)
+    noise = rng.normal(0, 6, (300, 300, 1)).astype(np.float32)
+    img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    layer = tt.make_detail_layer(img, (40, 40, 220, 220), (240, 240))
+    h, w = layer.shape
+    near_edge = np.abs(layer[h // 4:3 * h // 4, w // 2 - 6:w // 2 + 6]).mean()
+    away = np.abs(layer[h // 4:3 * h // 4, w // 5:w // 5 + 12]).mean()
+    assert away > 0.3                                    # real texture survives
+    assert near_edge < 2.0 * away                        # the outline is not amplified into a line
