@@ -14,6 +14,13 @@ def skin_frame(w=200, h=200, seed=0):
     return f
 
 
+def skin_photo(seed=3, size=300, sd=6.0):
+    """A plain skin-coloured photo with fine grain: what a real, evenly lit reference looks like to the engine."""
+    rng = np.random.default_rng(seed)
+    img = np.empty((size, size, 3), np.float32); img[:] = SKIN
+    return np.clip(img + rng.normal(0, sd, (size, size, 1)), 0, 255).astype(np.uint8)
+
+
 def hf_energy(f, box):
     x, y, w, h = [int(v) for v in box]
     g = cv2.cvtColor(f[y:y + h, x:x + w], cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -74,7 +81,7 @@ def test_smooth_tracks_all_none():
 
 def test_process_video_with_fake_detector(tmp_path):
     src = make_video(tmp_path / "s.mp4", SKIN, n=12, fps=24, w=160, h=160)
-    ref = tmp_path / "r.png"; cv2.imwrite(str(ref), np.random.default_rng(3).integers(100, 180, (300, 300, 3), dtype=np.uint8))
+    ref = tmp_path / "r.png"; cv2.imwrite(str(ref), skin_photo(3))
     box = (40, 40, 80, 80)
     out = tmp_path / "o.mp4"
     st = tt.process_video(src, ref, out, strength=1.0, detector=lambda f: (box, 1.0))
@@ -106,21 +113,69 @@ def test_reject_outliers_drops_tiny_false_box():
     assert out[6] == (None, 0.0) and out[0][0] == (0, 0, 200, 200) and out[7] == (None, 0.0)
 
 
-def test_detail_layer_suppresses_large_edge_keeps_texture():
-    import numpy as np
-    import texture_transfer as tt
-    rng = np.random.default_rng(1)
-    img = np.zeros((300, 300, 3), np.uint8)
-    img[...] = (120, 150, 200)
-    img[:, 150:] = (60, 80, 110)                         # strong vertical outline (still skin-coloured)
-    noise = rng.normal(0, 6, (300, 300, 1)).astype(np.float32)
-    img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-    layer = tt.make_detail_layer(img, (40, 40, 220, 220), (240, 240))
-    h, w = layer.shape
-    near_edge = np.abs(layer[h // 4:3 * h // 4, w // 2 - 6:w // 2 + 6]).mean()
-    away = np.abs(layer[h // 4:3 * h // 4, w // 5:w // 5 + 12]).mean()
-    assert away > 0.3                                    # real texture survives
-    assert near_edge < 2.0 * away                        # the outline is not amplified into a line
+def _hf(img_bgr, size_wh, sigma):
+    g = cv2.cvtColor(cv2.resize(img_bgr, size_wh, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY).astype(np.float32)
+    return g - cv2.GaussianBlur(g, (0, 0), sigma)
+
+
+def _ref_with_features(seed=1, sd=6.0):
+    """Skin grain plus things a face has: a dark 'eye' blob, a red 'mouth' bar and a bright 'tooth' stripe."""
+    img = skin_photo(seed, 400, sd)
+    cv2.ellipse(img, (150, 170), (40, 18), 0, 0, 360, (20, 20, 25), -1)
+    cv2.ellipse(img, (260, 170), (40, 18), 0, 0, 360, (20, 20, 25), -1)
+    cv2.rectangle(img, (150, 290), (260, 320), (90, 90, 200), -1)
+    cv2.rectangle(img, (170, 300), (240, 308), (240, 240, 240), -1)
+    return img
+
+
+def test_layer_is_new_grain_not_a_copy_of_the_reference_features():
+    """Found in the live test: pasting the reference's high-pass layer put its eyes, nose and mouth on the swapped face."""
+    ref = _ref_with_features()
+    box = (100, 100, 200, 200)
+    size = (240, 280)
+    layer = tt.make_detail_layer(ref, box, size)
+    x, y, w, h = [int(round(v)) for v in tt.pad_box(box)]
+    ref_hf = _hf(ref[y:y + h, x:x + w], size, max(1.0, 0.005 * size[0]))
+    r = float(np.corrcoef(layer.ravel(), ref_hf.ravel())[0, 1])
+    assert abs(r) < 0.1, r                                   # no copied structure at all
+    # and the grain is even: no hot spot where the reference's eyes / mouth were
+    e = cv2.GaussianBlur(np.abs(layer), (0, 0), 6)
+    inner = e[int(.15 * size[1]):int(.85 * size[1]), int(.15 * size[0]):int(.85 * size[0])]
+    assert inner.max() < 1.8 * np.median(inner), (inner.max(), np.median(inner))
+
+
+def test_layer_strength_follows_the_references_grain_and_is_repeatable():
+    box = (100, 100, 200, 200); size = (240, 280)
+    fine = tt.make_detail_layer(skin_photo(1, 400, 4.0), box, size)
+    rough = tt.make_detail_layer(skin_photo(1, 400, 8.0), box, size)
+    assert 1.5 < rough.std() / fine.std() < 2.6              # twice the reference grain -> about twice the layer
+    assert abs(float(rough.mean())) < 0.5 and fine.shape == (280, 240)
+    again = tt.make_detail_layer(skin_photo(1, 400, 8.0), box, size)
+    assert np.array_equal(rough, again)                      # same photo -> same layer, so preview == render
+
+
+def test_reference_without_plain_skin_is_refused_with_a_plain_message():
+    blue = np.zeros((300, 300, 3), np.uint8); blue[:] = (200, 60, 30)
+    with pytest.raises(ValueError, match="plain skin"):
+        tt.make_detail_layer(blue, (60, 60, 180, 180), (120, 140))
+
+
+def test_swapped_faces_own_features_are_left_alone():
+    """Eyes, glasses frame, brows and lips of the swapped face must not receive grain; plain cheeks must."""
+    f = skin_frame(300, 300)
+    cv2.ellipse(f, (105, 120), (22, 11), 0, 0, 360, (25, 25, 30), -1)      # eye
+    cv2.rectangle(f, (70, 95), (230, 101), (30, 30, 35), -1)              # glasses frame / brow bar
+    cv2.rectangle(f, (110, 205), (190, 225), (95, 95, 205), -1)           # lips (redder than skin)
+    f = cv2.GaussianBlur(f, (0, 0), 1.2)
+    box = (50, 50, 200, 200)
+    layer = np.random.default_rng(5).normal(0, 6, (260, 240)).astype(np.float32)
+    out = tt.apply_texture(f, box, layer, strength=3.0)
+    d = np.abs(out.astype(int) - f.astype(int)).sum(axis=2).astype(float)
+    cheek = d[150:190, 80:130].mean()
+    assert cheek > 1.0                                        # grain is added on plain skin
+    assert d[110:130, 90:120].mean() < 0.35 * cheek           # eye
+    assert d[94:103, 80:220].mean() < 0.35 * cheek            # frame / brow
+    assert d[208:222, 115:185].mean() < 0.35 * cheek          # lips
 
 
 # ---- slider support: default 2.0, range 0..3, prepare once / preview any strength / render on confirm ----
@@ -138,7 +193,7 @@ def test_slider_constants_and_clamp():
 
 def _prepared(tmp_path, n=6):
     src = make_video(tmp_path / "s.mp4", SKIN, n=n, fps=24, w=160, h=160)
-    ref = tmp_path / "r.png"; cv2.imwrite(str(ref), np.random.default_rng(3).integers(60, 200, (300, 300, 3), dtype=np.uint8))
+    ref = tmp_path / "r.png"; cv2.imwrite(str(ref), skin_photo(3))
     box = (40, 40, 80, 80)
     return src, tt.prepare(src, ref, detector=lambda f: (box, 1.0)), box
 

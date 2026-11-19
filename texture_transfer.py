@@ -6,6 +6,11 @@ lighting or colour comes along), attaches it to the tracked face box and adds it
 Because it is anchored to the face box (not the screen), it moves with the head. Stubble and pores are
 random patterns, so exact feature alignment is not needed, only the right density in the right area.
 
+v2 (found in the live test): copying the reference's high-pass layer pixel for pixel also copied its eyes, brows,
+nose lines and mouth, which showed up as a mask on the swapped face. So the layer is now NEW grain, made from the
+reference's clean-skin statistics only (same pore size and strength, no features, no layout), and apply_texture
+keeps it off the swapped face's own eyes, glasses, brows, lips and hard edges.
+
 CPU only, OpenCV only (Haar cascades ship inside opencv), no new model weights, so no licence issue.
 Limits: box tracking, not a 3D face fit; strong head turns and profile views get a weaker effect.
 """
@@ -31,10 +36,45 @@ def skin_prob(bgr):
     return np.clip(m, 0, 1)
 
 
-def make_detail_layer(ref_bgr, ref_box, size_wh, sigma_frac=0.010, clip_mult=2.5):
-    """High-frequency luminance layer of the reference face, resized to size_wh (w, h).
+def _radial_profile(patches, nbins=32):
+    """Average isotropic amplitude spectrum (cycles/pixel 0..0.5) of zero-mean patches. Returns (freqs, amps)."""
+    p = patches[0].shape[0]
+    win = np.outer(np.hanning(p), np.hanning(p)).astype(np.float32)
+    pw = np.zeros((p, p), np.float64)
+    for q in patches:
+        q = (q - q.mean()) * win
+        pw += np.abs(np.fft.fft2(q)) ** 2
+    pw /= len(patches)
+    fy, fx = np.fft.fftfreq(p)[:, None], np.fft.fftfreq(p)[None, :]
+    fr = np.hypot(fy, fx)
+    edges = np.linspace(0.0, 0.5, nbins + 1)
+    idx = np.clip(np.digitize(fr, edges) - 1, 0, nbins - 1)
+    amps = np.array([np.sqrt(pw[idx == k].mean()) if (idx == k).any() else 0.0 for k in range(nbins)])
+    return 0.5 * (edges[:-1] + edges[1:]), amps
 
-    Returns float32 (h, w): zero mean, soft-clipped so strong edges (brows, nostrils) are not pasted.
+
+def _clean_skin_mask(y_ch, hf, sk_mask, sigma, k_e=1.6):
+    """True where the reference is plain skin: skin coloured, no feature edges, no outlier brightness or contrast."""
+    skin = sk_mask > 0.8
+    if not skin.any():
+        return skin
+    coarse = cv2.GaussianBlur(y_ch, (0, 0), sigma * 3.0)
+    gx, gy = cv2.Sobel(coarse, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(coarse, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.GaussianBlur(np.hypot(gx, gy), (0, 0), sigma * 2.0)
+    energy = cv2.GaussianBlur(np.abs(hf), (0, 0), sigma * 3.0)
+    lum = cv2.GaussianBlur(y_ch, (0, 0), sigma * 3.0)
+    ok = skin & (mag < k_e * np.median(mag[skin])) & (energy < k_e * np.median(energy[skin]))
+    ok &= np.abs(lum - np.median(lum[skin])) < 0.22 * max(1.0, float(np.median(lum[skin])))
+    k = max(1, int(round(sigma)))
+    return cv2.erode(ok.astype(np.uint8), np.ones((2 * k + 1, 2 * k + 1), np.uint8)).astype(bool)
+
+
+def make_detail_layer(ref_bgr, ref_box, size_wh, sigma_frac=0.005, clip_mult=2.5, seed=1234):
+    """NEW skin grain with the reference's clean-skin statistics, sized size_wh (w, h).
+
+    Returns float32 (h, w): zero mean, soft-clipped. It has the reference's pore size and strength, but none of its
+    features (no eyes, brows, nose or mouth), so nothing is pasted at the wrong place. Same input -> same layer,
+    so a preview and the full render always match.
     """
     x, y, w, h = [int(round(v)) for v in pad_box(ref_box)]
     H, W = ref_bgr.shape[:2]
@@ -48,24 +88,70 @@ def make_detail_layer(ref_bgr, ref_box, size_wh, sigma_frac=0.010, clip_mult=2.5
     y_ch = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
     sigma = max(1.0, sigma_frac * size_wh[0])
     hf = y_ch - cv2.GaussianBlur(y_ch, (0, 0), sigma)
-    hf *= sk_mask
-    # keep real texture, drop copied outlines: attenuate near large-scale edges (jaw, hair line, ear) of the reference
-    coarse = cv2.GaussianBlur(y_ch, (0, 0), sigma * 3.0)
-    gx, gy = cv2.Sobel(coarse, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(coarse, cv2.CV_32F, 0, 1, ksize=3)
-    mag = cv2.GaussianBlur(np.hypot(gx, gy), (0, 0), sigma * 2.0)
-    g0 = 2.0 * float(np.median(mag[sk_mask > 0.5])) + 1e-3 if (sk_mask > 0.5).any() else float(mag.mean()) + 1e-3
-    hf *= 1.0 / (1.0 + (mag / g0) ** 4)
-    # feather the borders so the crop edge can never draw a line
     hh, ww = hf.shape
-    fy = np.clip(np.minimum(np.arange(hh), hh - 1 - np.arange(hh)) / (0.10 * hh), 0, 1)
-    fx = np.clip(np.minimum(np.arange(ww), ww - 1 - np.arange(ww)) / (0.10 * ww), 0, 1)
-    hf *= np.outer(fy, fx).astype(np.float32)
-    sd = float(hf[sk_mask > 0.5].std()) if (sk_mask > 0.5).any() else float(hf.std())
+    patches, clean = [], None
+    for k_e in (1.6, 2.2, 3.0):                                  # strict first; looser only if the photo has little plain skin
+        clean = _clean_skin_mask(y_ch, hf, sk_mask, sigma, k_e)
+        for p in (64, 48, 32, 24, 16):
+            if min(hh, ww) < p * 2:
+                continue
+            step = max(4, p // 3)
+            patches = [hf[j:j + p, i:i + p] for j in range(0, hh - p + 1, step) for i in range(0, ww - p + 1, step)
+                       if clean[j:j + p, i:i + p].mean() >= 0.96]
+            if len(patches) >= 3:
+                break
+        if len(patches) >= 3 and int(clean.sum()) >= 400:
+            break
+    if len(patches) < 3 or int(clean.sum()) < 400:
+        raise ValueError("Not enough plain skin in the reference photo (glasses, hair, beard, shadows or heavy make-up "
+                         "cover it). Use a sharper, evenly lit, front-facing photo.")
+    freqs, amps = _radial_profile(patches)
+    sd = float(hf[clean].std())                                   # strength of the reference's plain-skin grain
     if sd < 1e-6:
         return np.zeros_like(hf)
+    # filter white noise so its spectrum matches the reference skin's, then set its strength to the reference's
+    fy, fx = np.fft.fftfreq(hh)[:, None], np.fft.rfftfreq(ww)[None, :]
+    filt = np.interp(np.hypot(fy, fx), freqs, amps, left=amps[0], right=amps[-1]).astype(np.float32)
+    filt[0, 0] = 0.0                                              # no low-frequency / brightness drift at all
+    noise = np.random.default_rng(seed).standard_normal((hh, ww)).astype(np.float32)
+    layer = np.fft.irfft2(np.fft.rfft2(noise) * filt, s=(hh, ww)).astype(np.float32)
+    layer -= layer.mean()
+    layer *= sd / max(float(layer.std()), 1e-9)
     c = clip_mult * sd
-    hf = c * np.tanh(hf / c)
-    return hf.astype(np.float32)
+    layer = c * np.tanh(layer / c)
+    # feather the borders so the crop edge can never draw a line
+    fy2 = np.clip(np.minimum(np.arange(hh), hh - 1 - np.arange(hh)) / (0.10 * hh), 0, 1)
+    fx2 = np.clip(np.minimum(np.arange(ww), ww - 1 - np.arange(ww)) / (0.10 * ww), 0, 1)
+    layer *= np.outer(fy2, fx2).astype(np.float32)
+    return layer.astype(np.float32)
+
+
+def protect_mask(roi_bgr, skin):
+    """0..1 weight: 1 on plain skin of the SWAPPED face, falling to 0 on its eyes, glasses, brows, lips and hard edges."""
+    h, w = roi_bgr.shape[:2]
+    y_ch = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    sigma = max(1.0, 0.012 * w)
+    sel = skin > 0.5
+    if not sel.any():
+        return np.zeros((h, w), np.float32)
+    coarse = cv2.GaussianBlur(y_ch, (0, 0), sigma * 1.5)
+    gx, gy = cv2.Sobel(coarse, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(coarse, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.GaussianBlur(np.hypot(gx, gy), (0, 0), sigma)
+    g0 = 2.5 * float(np.median(mag[sel])) + 1e-3
+    w_edge = 1.0 / (1.0 + (mag / g0) ** 2)                        # frames, brows, lip and eye edges, hairline
+    lum = cv2.GaussianBlur(y_ch, (0, 0), sigma)
+    ls = float(np.percentile(lum[sel], 75))                       # skin is brighter than hair, brows and frames
+    w_dark = np.clip((lum - 0.55 * ls) / (0.25 * ls + 1e-3), 0, 1)  # glasses frames, brows, pupils, hair
+    ycc = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2YCrCb).astype(np.float32)
+    cr = cv2.GaussianBlur(ycc[..., 1], (0, 0), sigma)
+    crs = float(np.median(cr[sel & (lum > 0.8 * ls)]) if (sel & (lum > 0.8 * ls)).any() else np.median(cr[sel]))
+    w_lip = np.clip(1.0 - (cr - (crs + 6.0)) / 10.0, 0, 1)           # redder than the skin around it = lips
+    # eyes sit in a fixed band of a face box: keep the grain off the eye sockets and the glasses' lens area
+    eyes = np.zeros((h, w), np.float32)
+    for cx in (0.30, 0.70):
+        cv2.ellipse(eyes, (int(cx * w), int(0.37 * h)), (int(0.17 * w), int(0.075 * h)), 0, 0, 360, 1.0, -1)
+    w_eye = 1.0 - cv2.GaussianBlur(eyes, (0, 0), max(1.5, 0.03 * w))
+    return (w_edge * w_dark * w_lip * w_eye).astype(np.float32)
 
 
 def apply_texture(frame_bgr, box, hf_layer, strength=1.0, weight=1.0):
@@ -84,7 +170,8 @@ def apply_texture(frame_bgr, box, hf_layer, strength=1.0, weight=1.0):
     # inscribed ellipse x skin colour: keeps the effect off hair, background and clothes
     ell = np.zeros(roi.shape[:2], np.float32)
     cv2.ellipse(ell, ((x1 - x0) // 2, (y1 - y0) // 2), (int((x1 - x0) * 0.46), int((y1 - y0) * 0.48)), 0, 0, 360, 1.0, -1)
-    mask = cv2.GaussianBlur(ell, (0, 0), max(2.0, 0.04 * w)) * skin_prob(roi)
+    skin = skin_prob(roi)
+    mask = cv2.GaussianBlur(ell, (0, 0), max(2.0, 0.04 * w)) * skin * protect_mask(roi, skin)
     ycc = cv2.cvtColor(roi, cv2.COLOR_BGR2YCrCb).astype(np.float32)
     ycc[..., 0] = np.clip(ycc[..., 0] + strength * weight * mask * layer, 0, 255)
     out = frame_bgr.copy()
@@ -198,7 +285,7 @@ def clamp_strength(strength):
     return min(MAX_STRENGTH, max(MIN_STRENGTH, v))
 
 
-def prepare(src, ref_path, sigma_frac=0.010, detector=detect_face):
+def prepare(src, ref_path, sigma_frac=0.005, detector=detect_face):
     """Do the slow, strength-independent work ONCE: find the face in the reference and track it through the clip.
 
     Returns a dict that preview_frame()/render_prepared() reuse for any strength, so a slider never re-detects.
@@ -251,7 +338,7 @@ def render_prepared(src, prepared, out, strength=DEFAULT_STRENGTH):
             "layer_size": prepared["layer_size"], "strength": strength}
 
 
-def process_video(src, ref_path, out, strength=1.0, sigma_frac=0.010, detector=detect_face):
+def process_video(src, ref_path, out, strength=1.0, sigma_frac=0.005, detector=detect_face):
     """Apply the texture transfer to a swapped clip. Keeps frame count, size and audio. Returns stats dict.
 
     Kept as the one-call form (old default strength 1.0, unchanged so existing callers behave the same).
