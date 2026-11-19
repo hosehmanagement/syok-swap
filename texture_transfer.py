@@ -69,6 +69,10 @@ def _clean_skin_mask(y_ch, hf, sk_mask, sigma, k_e=1.6):
     return cv2.erode(ok.astype(np.uint8), np.ones((2 * k + 1, 2 * k + 1), np.uint8)).astype(bool)
 
 
+SD_MIN = 1.6   # grey levels: a retouched / smooth reference would otherwise give grain too faint to see at any slider value
+SD_MAX = 4.0   # a very rough reference (stubble, heavy freckles) is not allowed to turn the whole face gritty
+
+
 def make_detail_layer(ref_bgr, ref_box, size_wh, sigma_frac=0.005, clip_mult=2.5, seed=1234):
     """NEW skin grain with the reference's clean-skin statistics, sized size_wh (w, h).
 
@@ -107,6 +111,7 @@ def make_detail_layer(ref_bgr, ref_box, size_wh, sigma_frac=0.005, clip_mult=2.5
                          "cover it). Use a sharper, evenly lit, front-facing photo.")
     freqs, amps = _radial_profile(patches)
     sd = float(hf[clean].std())                                   # strength of the reference's plain-skin grain
+    sd = min(SD_MAX, max(SD_MIN, sd))
     if sd < 1e-6:
         return np.zeros_like(hf)
     # filter white noise so its spectrum matches the reference skin's, then set its strength to the reference's
