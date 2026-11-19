@@ -26,8 +26,15 @@ BOX = (40, 40, 80, 80)
 FAKE = lambda f: (BOX, 1.0)
 
 
+def skin_photo(seed=3, size=300, sd=6.0):
+    """A plain skin-coloured photo with fine grain: what a real, evenly lit reference looks like to the engine."""
+    rng = np.random.default_rng(seed)
+    img = np.empty((size, size, 3), np.float32); img[:] = SKIN
+    return np.clip(img + rng.normal(0, sd, (size, size, 1)), 0, 255).astype(np.uint8)
+
+
 def photo_bytes(seed=3):
-    img = np.random.default_rng(seed).integers(100, 180, (300, 300, 3), dtype=np.uint8)
+    img = skin_photo(seed)
     ok, buf = cv2.imencode(".png", img)
     return buf.tobytes()
 
