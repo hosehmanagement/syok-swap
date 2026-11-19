@@ -8,11 +8,16 @@ Two steps so you never pay for a bad mask:
     modal run app.py::fetch                                   # one time, downloads ~50 GB of weights
     modal run app.py::preview --video v.mp4 --image face.png --consent yes
     modal run app.py::render  --job <id>
+
+The same two steps (plus Syok's texture slider on the result) are also served as ONE web app for the Syok "Recast -> Syok Swap"
+card, in the user's own Modal account:   modal deploy app.py     (see docs/SWAP.md).
 """
 import json
 import os
 import shutil
 import subprocess
+import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -48,15 +53,37 @@ image = (
     # from source). Use the official prebuilt wheel that matches torch 2.6 / CUDA 12 / python 3.11.
     .run_commands("pip install 'https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl' && python -c \"import importlib.metadata as m; print('flash_attn', m.version('flash_attn'))\"")
     .add_local_file(Path(__file__).parent / "swapkit.py", "/opt/swapkit.py")
+    .add_local_file(Path(__file__).parent / "texture_transfer.py", "/opt/texture_transfer.py")
+    .add_local_file(Path(__file__).parent / "texture_service.py", "/opt/texture_service.py")
+    .add_local_file(Path(__file__).parent / "swap_service.py", "/opt/swap_service.py")
     .add_local_file(Path(__file__).parent / "lora" / "face_detection_yunet_2023mar.onnx", "/opt/face_detection_yunet_2023mar.onnx")  # head detection for the mask
     .add_local_python_source("lora")   # lora/merge.py: merge an identity LoRA into the base weights at render time
 )
+
+# The small CPU image for everything that needs no model: the web endpoint, the slider's face tracking and render, the sweeper.
+HERE = Path(__file__).parent
+light = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("ffmpeg", "libgl1", "libglib2.0-0")
+    .pip_install("numpy<2", "opencv-python-headless<5", "fastapi[standard]")
+    .add_local_file(HERE / "swapkit.py", "/opt/swapkit.py")
+    .add_local_file(HERE / "texture_transfer.py", "/opt/texture_transfer.py")
+    .add_local_file(HERE / "texture_service.py", "/opt/texture_service.py")
+    .add_local_file(HERE / "swap_service.py", "/opt/swap_service.py")
+    .add_local_file(HERE / "swap_api.py", "/opt/swap_api.py")
+)
+WEIGHTS_FLAGS = "/cache"      # .weights-downloading / .weights-ok live next to the model folder
 
 
 @app.function(image=image, volumes={"/cache": cache}, timeout=7200, cpu=4)
 def fetch_weights():
     from huggingface_hub import snapshot_download
+    flag, ok = Path(WEIGHTS_FLAGS) / ".weights-downloading", Path(WEIGHTS_FLAGS) / ".weights-ok"
+    flag.write_text(str(time.time()))
+    cache.commit()                       # so the web endpoint can tell "downloading" from "missing"
     snapshot_download("Wan-AI/Wan2.2-Animate-14B", local_dir=WEIGHTS)
+    ok.write_text("ok")
+    flag.unlink(missing_ok=True)
     cache.commit()
     return sorted(p.name for p in Path(WEIGHTS).iterdir())
 
@@ -66,6 +93,31 @@ def _sk():
     sys.path.insert(0, "/opt")
     import swapkit
     return swapkit
+
+
+def _preview_core(sk, d, raw, ref, resolution, margin, start, length):
+    """Find the person and write mask.mp4 + preview.mp4 (red overlay) into job folder `d`. Returns the numbers the UI shows."""
+    info = sk.probe(raw)
+    s, l = sk.plan_section(info["duration"], start, length)
+    sec = d / "section.mp4"
+    sk.cut_section(raw, sec, s, l)
+    it, k = sk.MARGINS[margin]
+    w, h = sk.RESOLUTIONS[resolution]
+    pre = "/opt/wan/wan/modules/animate/preprocess"
+    (d / "proc").mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(
+        ["python", "preprocess_data.py", "--ckpt_path", f"{WEIGHTS}/process_checkpoint", "--video_path", str(sec),
+         "--refer_path", str(ref), "--save_path", str(d / "proc"), "--resolution_area", str(w), str(h),
+         "--replace_flag", "--iterations", str(it), "--k", str(k)],
+        cwd=pre, capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError("preprocess failed:\n" + (r.stdout + r.stderr)[-2500:])
+    # Wan's mask can leave the head out (SAM2 body points + a bounding box), which keeps the ORIGINAL head in the background
+    head = sk.cover_head_files(d / "proc", sec)
+    mask, inverted = sk.normalize_mask(d / "proc" / "src_mask.mp4", d / "mask.mp4")
+    stats = sk.mask_stats(mask)
+    sk.mask_preview(sec, mask, d / "preview.mp4")
+    return {"section": [s, l], "resolution": resolution, "margin": margin, "mask_inverted": inverted, "stats": stats, "head": head}
 
 
 @app.function(image=image, gpu=["L4", "A10G", "L40S"], volumes={"/cache": cache}, timeout=1800)
@@ -79,39 +131,15 @@ def make_preview(video: bytes, photo: bytes, photo_ext: str, resolution: str, ma
     raw.write_bytes(video)
     ref = d / f"person{photo_ext}"
     ref.write_bytes(photo)
-    info = sk.probe(raw)
-    s, l = sk.plan_section(info["duration"], start, length)
-    sec = d / "section.mp4"
-    sk.cut_section(raw, sec, s, l)
-    it, k = sk.MARGINS[margin]
-    w, h = sk.RESOLUTIONS[resolution]
-    pre = "/opt/wan/wan/modules/animate/preprocess"
-    r = subprocess.run(
-        ["python", "preprocess_data.py", "--ckpt_path", f"{WEIGHTS}/process_checkpoint", "--video_path", str(sec),
-         "--refer_path", str(ref), "--save_path", str(d / "proc"), "--resolution_area", str(w), str(h),
-         "--replace_flag", "--iterations", str(it), "--k", str(k)],
-        cwd=pre, capture_output=True, text=True)
-    if r.returncode:
-        raise RuntimeError("preprocess failed:\n" + (r.stdout + r.stderr)[-2500:])
-    # Wan's mask can leave the head out (SAM2 body points + a bounding box), which keeps the ORIGINAL head in the background
-    head = sk.cover_head_files(d / "proc", sec)
-    mask, inverted = sk.normalize_mask(d / "proc" / "src_mask.mp4", d / "mask.mp4")
-    stats = sk.mask_stats(mask)
-    sk.mask_preview(sec, mask, d / "preview.mp4")
-    meta = {"job": job, "section": [s, l], "resolution": resolution, "margin": margin, "mask_inverted": inverted, "stats": stats, "head": head}
+    meta = {"job": job, **_preview_core(sk, d, raw, ref, resolution, margin, start, length)}
     (d / "meta.json").write_text(json.dumps(meta, indent=1))
     cache.commit()
     return meta, (d / "preview.mp4").read_bytes()
 
 
-@app.function(image=image, gpu="H100", volumes={"/cache": cache}, timeout=3600)
-def render_job(job: str, relight: bool = True, feather: int = 7, full_res: bool = False, lora: str = "", lora_strength: float = 1.0):
-    sk = _sk()
-    cache.reload()
-    d = Path(JOBS) / job
-    meta = json.loads((d / "meta.json").read_text())
-    if meta["stats"]["warnings"] and any("empty" in x for x in meta["stats"]["warnings"]):
-        raise ValueError("Refusing to render: " + "; ".join(meta["stats"]["warnings"]))
+def _render_core(sk, d, relight, feather, full_res, lora, lora_strength):
+    """Generate the new person on the GPU, paste it over the ORIGINAL frames, restore the ORIGINAL soundtrack.
+    Leaves generated.mp4 and final.mp4 in job folder `d` and returns whether the original had audio."""
     # work on local disk, not the network volume: generate.py reads src_ref.png with cv2.imread, which returned None
     # for the volume copy inside the GPU container (the same file reads fine from a CPU container)
     w = Path("/tmp/work")
@@ -150,10 +178,132 @@ def render_job(job: str, relight: bool = True, feather: int = 7, full_res: bool 
     final, had_audio = sk.mux_original_audio(comp, w / "section.mp4", w / "final.mp4")
     shutil.copy(gen, d / "generated.mp4")
     shutil.copy(final, d / "final.mp4")
+    return had_audio
+
+
+
+
+@app.function(image=image, gpu="H100", volumes={"/cache": cache}, timeout=3600)
+def render_job(job: str, relight: bool = True, feather: int = 7, full_res: bool = False, lora: str = "", lora_strength: float = 1.0):
+    sk = _sk()
+    cache.reload()
+    d = Path(JOBS) / job
+    meta = json.loads((d / "meta.json").read_text())
+    if meta["stats"]["warnings"] and any("empty" in x for x in meta["stats"]["warnings"]):
+        raise ValueError("Refusing to render: " + "; ".join(meta["stats"]["warnings"]))
+    had_audio = _render_core(sk, d, relight, feather, full_res, lora, lora_strength)
     meta.update(done=True, had_audio=had_audio)
     (d / "meta.json").write_text(json.dumps(meta, indent=1))
     cache.commit()
-    return (d / "final.mp4").read_bytes(), (gen).read_bytes()
+    return (d / "final.mp4").read_bytes(), (d / "generated.mp4").read_bytes()
+
+
+# ---- the one-flow job service used by the Syok card (swap_service.py / swap_api.py): mask -> swap -> slider -> save ----
+
+def _svc():
+    if "/opt" not in sys.path:
+        sys.path.insert(0, "/opt")
+    import swap_service
+    import texture_service
+    return swap_service, texture_service
+
+
+def _friendly(e, fallback):
+    """Our own refusals (ValueError) are written for the user and safe to show; anything else gets the plain fallback."""
+    return str(e) if isinstance(e, ValueError) else fallback
+
+
+@app.function(image=image, gpu=["L4", "A10G", "L40S"], volumes={"/cache": cache}, timeout=3600, max_containers=2)
+def mask_job(job: str):
+    """Step 1 (cents): find the person and make the red-overlay preview. A bad mask costs almost nothing to find out here."""
+    sk = _sk()
+    ss, ts = _svc()
+    cache.reload()
+    q = ss.request_of(JOBS, job)
+    d = q["dir"]
+    ts.set_stage(d, "mask", state="preparing")
+    cache.commit()
+    try:
+        m = _preview_core(sk, d, d / "raw.mp4", d / q["ref"], q["resolution"], q["margin"], q["start"], q["length"])
+        ss.mask_ready(JOBS, job, m["section"], m["stats"], m["head"])
+    except Exception as e:
+        ss.fail(JOBS, job, "mask", _friendly(e, "The mask step failed. Nothing was swapped and no swap was charged. Try a clearer clip."))
+        raise
+    finally:
+        cache.commit()
+
+
+@app.function(image=image, gpu="H100", volumes={"/cache": cache}, timeout=10800, max_containers=1)
+def swap_job(job: str):
+    """Step 2 (the paid one): generate the new person, then hand the swapped clip to the slider's face tracking."""
+    sk = _sk()
+    ss, ts = _svc()
+    cache.reload()
+    d = ts.job_dir(JOBS, job)
+    meta = ts.read_meta(d)
+    relight = bool(meta.get("swap", {}).get("relight", True))
+    ts.set_stage(d, "swap", state="generating")
+    cache.commit()
+    try:
+        had_audio = _render_core(sk, d, relight, 7, False, "", 1.0)
+        ss.finish_swap(JOBS, job, d / "final.mp4", had_audio)
+        (d / "final.mp4").unlink(missing_ok=True)        # final.mp4 is the TEXTURED result from here on; the swapped clip is src.mp4
+        cache.commit()
+    except Exception as e:
+        ss.fail(JOBS, job, "swap", _friendly(e, "The swap failed. Try again; the mask is kept, so nothing needs to be uploaded again."))
+        cache.commit()
+        raise
+    try:
+        prepare_job.spawn(job)                           # CPU, cents: the slider can be used as soon as this is done
+    except Exception:
+        ss.fail(JOBS, job, "prepare", "The swap is done, but preparing the texture slider could not start. You can still download the swapped clip.")
+        cache.commit()
+        raise
+
+
+@app.function(image=light, volumes={"/cache": cache}, cpu=2, timeout=1800)
+def prepare_job(job: str):
+    cache.reload()
+    _svc()[1].run_prepare(JOBS, job)
+    cache.commit()
+
+
+@app.function(image=light, volumes={"/cache": cache}, cpu=2, timeout=3600)
+def texture_render_job(job: str):
+    cache.reload()
+    _svc()[1].run_render(JOBS, job)
+    cache.commit()
+
+
+@app.function(image=light, volumes={"/cache": cache}, schedule=modal.Period(hours=6), timeout=600)
+def sweep_old_jobs():
+    """Jobs (uploads, the swapped clip, the result) are deleted after 3 days, the same time the result is kept in the user's Cloudflare."""
+    cache.reload()
+    n = _svc()[1].sweep(JOBS)
+    cache.commit()
+    return n
+
+
+@app.function(image=light, volumes={"/cache": cache}, cpu=2, timeout=600, max_containers=3)
+@modal.concurrent(max_inputs=4)
+@modal.asgi_app(requires_proxy_auth=True)
+def web():
+    if "/opt" not in sys.path:
+        sys.path.insert(0, "/opt")
+    import swap_api
+    import swap_service
+
+    def reload():
+        try:
+            cache.reload()
+        except Exception:      # a volume with files open by a concurrent request cannot reload; the next request will
+            pass
+
+    def weights_state():
+        return swap_service.weights_state(WEIGHTS, WEIGHTS_FLAGS)
+
+    return swap_api.build_app(JOBS, mask_job.spawn, swap_job.spawn, texture_render_job.spawn, fetch_weights.spawn,
+                              weights_state, before_read=reload, after_write=cache.commit)
 
 
 @app.function(image=image, volumes={"/cache": cache}, cpu=4, timeout=900)

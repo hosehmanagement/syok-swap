@@ -16,6 +16,8 @@ Replace the person in a video with a character from **one photo**. Open, self-ho
 | Work on a section (start, length) of the source | Openjutsu | `--start --length` |
 | Keep everything outside the swapped person | Openjutsu | generated person is pasted over the **original frames at original size** (feathered) |
 
+**Texture slider (0 to 3, default 2.0) is part of every swap**, see `docs/SWAP.md` for the one-flow web endpoint and deploy.
+
 Not done yet: multi-person, hat/face-fix second pass, long clips above 30 s.
 
 ## Use

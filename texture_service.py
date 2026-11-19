@@ -58,13 +58,16 @@ def _write_meta(d, meta):
 
 def _set(d, stage, **kw):
     meta = _read_meta(d)
-    meta.setdefault(stage, {}).update(kw)
+    meta.setdefault(stage, {}).update(kw, at=time.time())      # "at" lets the status call notice a step that died without saying so
     _write_meta(d, meta)
     return meta
 
 
-def new_job(root, video, photo, photo_ext, consent):
-    """Store the two uploads and return the new job id. The slow work happens later in run_prepare()."""
+def new_job(root, video, photo, photo_ext, consent, video_name="src.mp4", meta=None):
+    """Store the two uploads and return the new job id. The slow work happens later in run_prepare().
+
+    The swap service (swap_service.py) reuses this with video_name="raw.mp4": the upload is the ORIGINAL clip there, and
+    src.mp4 only appears once the swap has made the swapped clip the texture slider works on. `meta` adds keys to meta.json."""
     if consent != "yes":
         raise JobError("Only use photos and videos of people who agreed to it (or fictional characters). Send consent=yes.")
     ext = (photo_ext or "").lower()
@@ -78,16 +81,18 @@ def new_job(root, video, photo, photo_ext, consent):
     d = Path(root) / job
     d.mkdir(parents=True)
     try:
-        (d / "src.mp4").write_bytes(video)
+        (d / video_name).write_bytes(video)
         (d / f"ref{ext}").write_bytes(photo)
         try:
-            info = sk.probe(d / "src.mp4")
+            info = sk.probe(d / video_name)
         except Exception:
             raise JobError("That video could not be read. Use an MP4.")
-        if info["duration"] > sk.MAX_SECONDS:
+        if info["duration"] > sk.MAX_SECONDS and video_name == "src.mp4":
             raise JobError(f"Video is longer than {int(sk.MAX_SECONDS)} seconds.")
-        _write_meta(d, {"job": job, "created": time.time(), "ref": f"ref{ext}",
-                        "prepare": {"state": "queued"}, "render": {"state": "idle"}})
+        base = {"job": job, "created": time.time(), "ref": f"ref{ext}",
+                "prepare": {"state": "queued"}, "render": {"state": "idle"}}
+        base.update(meta or {})
+        _write_meta(d, base)
     except Exception:
         shutil.rmtree(d, ignore_errors=True)
         raise
@@ -199,3 +204,7 @@ def sweep(root, now=None, ttl=JOB_TTL_SECONDS):
             shutil.rmtree(d, ignore_errors=True)
             removed += 1
     return removed
+
+
+# Public names for the swap service, which keeps the swap stages in the same job folder and meta.json.
+job_dir, read_meta, write_meta, set_stage = _dir, _read_meta, _write_meta, _set
