@@ -146,12 +146,22 @@ def test_layer_is_new_grain_not_a_copy_of_the_reference_features():
 
 def test_layer_strength_follows_the_references_grain_and_is_repeatable():
     box = (100, 100, 200, 200); size = (240, 280)
-    fine = tt.make_detail_layer(skin_photo(1, 400, 4.0), box, size)
-    rough = tt.make_detail_layer(skin_photo(1, 400, 8.0), box, size)
-    assert 1.5 < rough.std() / fine.std() < 2.6              # twice the reference grain -> about twice the layer
+    fine = tt.make_detail_layer(skin_photo(1, 400, 2.5), box, size)
+    rough = tt.make_detail_layer(skin_photo(1, 400, 5.0), box, size)
+    assert 1.5 < rough.std() / fine.std() < 2.5              # twice the reference grain -> about twice the layer
     assert abs(float(rough.mean())) < 0.5 and fine.shape == (280, 240)
-    again = tt.make_detail_layer(skin_photo(1, 400, 8.0), box, size)
+    again = tt.make_detail_layer(skin_photo(1, 400, 5.0), box, size)
     assert np.array_equal(rough, again)                      # same photo -> same layer, so preview == render
+
+
+def test_grain_has_a_floor_for_smooth_photos_and_a_cap_for_rough_ones():
+    """A retouched reference must still give visible grain (live test: it was ~1 grey level); a rough one must not run wild."""
+    box = (100, 100, 200, 200); size = (240, 280)
+    smooth = tt.make_detail_layer(skin_photo(1, 400, 0.4), box, size)
+    rough = tt.make_detail_layer(skin_photo(1, 400, 40.0), box, size)
+    inner = (slice(40, 240), slice(30, 210))
+    assert 0.85 * tt.SD_MIN < smooth[inner].std() < 1.15 * tt.SD_MIN
+    assert rough[inner].std() < 1.15 * tt.SD_MAX
 
 
 def test_reference_without_plain_skin_is_refused_with_a_plain_message():
