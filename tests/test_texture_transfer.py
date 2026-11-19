@@ -121,3 +121,57 @@ def test_detail_layer_suppresses_large_edge_keeps_texture():
     away = np.abs(layer[h // 4:3 * h // 4, w // 5:w // 5 + 12]).mean()
     assert away > 0.3                                    # real texture survives
     assert near_edge < 2.0 * away                        # the outline is not amplified into a line
+
+
+# ---- slider support: default 2.0, range 0..3, prepare once / preview any strength / render on confirm ----
+
+def test_slider_constants_and_clamp():
+    assert tt.DEFAULT_STRENGTH == 2.0 and tt.MIN_STRENGTH == 0.0 and tt.MAX_STRENGTH == 3.0
+    assert tt.clamp_strength(2.0) == 2.0
+    assert tt.clamp_strength(-1) == 0.0
+    assert tt.clamp_strength(9) == 3.0
+    assert tt.clamp_strength("1.5") == 1.5
+    for bad in (None, "x", float("nan")):
+        with pytest.raises(ValueError):
+            tt.clamp_strength(bad)
+
+
+def _prepared(tmp_path, n=6):
+    src = make_video(tmp_path / "s.mp4", SKIN, n=n, fps=24, w=160, h=160)
+    ref = tmp_path / "r.png"; cv2.imwrite(str(ref), np.random.default_rng(3).integers(60, 200, (300, 300, 3), dtype=np.uint8))
+    box = (40, 40, 80, 80)
+    return src, tt.prepare(src, ref, detector=lambda f: (box, 1.0)), box
+
+
+def test_preview_frame_matches_full_render_at_same_strength(tmp_path):
+    src, prep, box = _prepared(tmp_path)
+    out = tmp_path / "o.mp4"
+    tt.render_prepared(src, prep, out, strength=2.0)
+    full = list(sk.frames(out))
+    prev = tt.preview_frame(src, prep, 3, 2.0)
+    # the video is re-encoded, so allow codec noise; the preview must be the same picture, not a different strength
+    assert np.abs(full[3].astype(int) - prev.astype(int)).mean() < 3.0
+
+
+def test_preview_detail_grows_with_strength_and_zero_is_untouched(tmp_path):
+    src, prep, box = _prepared(tmp_path)
+    e = {s: hf_energy(tt.preview_frame(src, prep, 2, s), box) for s in (0, 1.0, 2.0, 3.0)}
+    assert e[0] < e[1.0] < e[2.0] < e[3.0]
+    orig = next(iter(sk.frames(src)))
+    assert np.array_equal(tt.preview_frame(src, prep, 0, 0), orig)
+
+
+def test_preview_clamps_and_rejects_bad_frame(tmp_path):
+    src, prep, box = _prepared(tmp_path)
+    assert np.array_equal(tt.preview_frame(src, prep, 1, 99), tt.preview_frame(src, prep, 1, 3.0))
+    with pytest.raises(IndexError):
+        tt.preview_frame(src, prep, 6, 2.0)
+    with pytest.raises(IndexError):
+        tt.preview_frame(src, prep, -1, 2.0)
+
+
+def test_prepare_refuses_when_no_face(tmp_path):
+    src = make_video(tmp_path / "s.mp4", SKIN, n=4, fps=24, w=64, h=64)
+    ref = tmp_path / "r.png"; cv2.imwrite(str(ref), np.full((64, 64, 3), 120, np.uint8))
+    with pytest.raises(ValueError):
+        tt.prepare(src, ref, detector=lambda f: (None, 0.0))

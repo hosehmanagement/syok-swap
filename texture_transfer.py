@@ -182,8 +182,27 @@ def smooth_tracks(dets, max_gap=10, window=5):
     return out
 
 
-def process_video(src, ref_path, out, strength=1.0, sigma_frac=0.010, detector=detect_face):
-    """Apply the texture transfer to a swapped clip. Keeps frame count, size and audio. Returns stats dict."""
+DEFAULT_STRENGTH = 2.0   # measured on one fictional face: 2.0 carries 0.98-1.04 of the reference's fine detail
+MIN_STRENGTH = 0.0       # 0 = texture pass off (lets a user compare with and without)
+MAX_STRENGTH = 3.0       # 3.0 already overshoots the reference (1.4x) and looks gritty by eye; do not offer more
+
+
+def clamp_strength(strength):
+    """Slider value -> a safe strength in [MIN_STRENGTH, MAX_STRENGTH]. Refuses NaN/None/non-numbers."""
+    try:
+        v = float(strength)
+    except (TypeError, ValueError):
+        raise ValueError("Strength must be a number.")
+    if v != v:
+        raise ValueError("Strength must be a number.")
+    return min(MAX_STRENGTH, max(MIN_STRENGTH, v))
+
+
+def prepare(src, ref_path, sigma_frac=0.010, detector=detect_face):
+    """Do the slow, strength-independent work ONCE: find the face in the reference and track it through the clip.
+
+    Returns a dict that preview_frame()/render_prepared() reuse for any strength, so a slider never re-detects.
+    """
     ref = cv2.imread(str(ref_path))
     if ref is None:
         raise ValueError("Reference image unreadable.")
@@ -191,24 +210,51 @@ def process_video(src, ref_path, out, strength=1.0, sigma_frac=0.010, detector=d
     if ref_box is None:
         raise ValueError("No face found in the reference image.")
     info = sk.probe(src)
-    frames = list(sk.frames(src))
-    dets = [detector(f) for f in frames]
+    dets = [detector(f) for f in sk.frames(src)]
     tracks = smooth_tracks(reject_outliers(dets))
     widths = [b[2] for b, w in tracks if b is not None and w >= 0.7]
     if not widths:
         raise ValueError("No face tracked in the clip; nothing to do.")
     size = int(round(float(np.median(widths)) * PAD[2])), int(round(float(np.median(widths)) * PAD[3]))
     layer = make_detail_layer(ref, ref_box, size, sigma_frac)
+    return {"info": info, "tracks": tracks, "layer": layer, "layer_size": size,
+            "frames": len(dets), "detected": sum(b is not None for b, _ in dets)}
+
+
+def preview_frame(src, prepared, index, strength=DEFAULT_STRENGTH):
+    """One finished frame (BGR uint8) at the given strength: what a slider shows while it is dragged."""
+    strength = clamp_strength(strength)
+    if not 0 <= index < prepared["frames"]:
+        raise IndexError(f"Frame {index} is outside 0..{prepared['frames'] - 1}.")
+    for i, f in enumerate(sk.frames(src)):
+        if i == index:
+            b, wgt = prepared["tracks"][i]
+            return apply_texture(f, b, prepared["layer"], strength, wgt)
+    raise IndexError(f"Frame {index} not found in the clip.")
+
+
+def render_prepared(src, prepared, out, strength=DEFAULT_STRENGTH):
+    """Write the whole clip at the chosen strength (audio kept). Returns the same stats dict as process_video."""
+    strength = clamp_strength(strength)
+    info = prepared["info"]
     tmp = str(out) + ".noaudio.mp4"
     wr = sk.Writer(tmp, info["width"], info["height"], info["fps"])
     applied = 0
     try:
-        for f, (b, wgt) in zip(frames, tracks):
-            g = apply_texture(f, b, layer, strength, wgt)
+        for f, (b, wgt) in zip(sk.frames(src), prepared["tracks"]):
+            wr.put(apply_texture(f, b, prepared["layer"], strength, wgt))
             applied += int(b is not None)
-            wr.put(g)
     finally:
         wr.close()
     sk.mux_original_audio(tmp, src, out)
-    return {"frames": len(frames), "applied": applied, "detected": sum(b is not None for b, _ in dets),
-            "layer_size": size, "strength": strength}
+    return {"frames": prepared["frames"], "applied": applied, "detected": prepared["detected"],
+            "layer_size": prepared["layer_size"], "strength": strength}
+
+
+def process_video(src, ref_path, out, strength=1.0, sigma_frac=0.010, detector=detect_face):
+    """Apply the texture transfer to a swapped clip. Keeps frame count, size and audio. Returns stats dict.
+
+    Kept as the one-call form (old default strength 1.0, unchanged so existing callers behave the same).
+    A slider UI should call prepare() once, then preview_frame() while dragging and render_prepared() on confirm.
+    """
+    return render_prepared(src, prepare(src, ref_path, sigma_frac, detector), out, strength)
