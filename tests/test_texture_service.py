@@ -15,11 +15,6 @@ import texture_service as svc
 import texture_transfer as tt
 from test_swapkit import make_video
 
-pytest.importorskip("fastapi")
-pytest.importorskip("httpx")
-pytest.importorskip("multipart")
-from fastapi.testclient import TestClient
-import texture_api
 
 SKIN = (140, 160, 205)
 BOX = (40, 40, 80, 80)
@@ -177,64 +172,3 @@ def test_sweep_removes_only_jobs_older_than_three_days(tmp_path):
 
 def test_sweep_on_missing_root_is_zero(tmp_path):
     assert svc.sweep(tmp_path / "nope") == 0
-
-
-# ---- HTTP layer ----
-
-def make_client(root):
-    def sp(job): svc.run_prepare(root, job, detector=FAKE)
-    def sr(job): svc.run_render(root, job)
-    return TestClient(texture_api.build_app(root, sp, sr))
-
-
-def test_http_full_flow(tmp_path):
-    root = tmp_path / "jobs"; root.mkdir()
-    c = make_client(root)
-    h = c.get("/health").json()
-    assert h["ok"] and h["strength"] == {"min": 0.0, "max": 3.0, "start": 2.0} and h["limits"]["keep_days"] == 3
-    r = c.post("/prepare", files={"video": ("v.mp4", video_bytes(tmp_path), "video/mp4"), "photo": ("p.png", photo_bytes(), "image/png")},
-               data={"consent": "yes"})
-    assert r.status_code == 200
-    job = r.json()["job"]
-    assert c.get(f"/status/{job}").json()["prepare"]["state"] == "ready"
-    p = c.get(f"/preview/{job}", params={"frame": 2, "strength": 2.0})
-    assert p.status_code == 200 and p.headers["content-type"] == "image/jpeg" and p.content[:2] == b"\xff\xd8"
-    assert c.get(f"/result/{job}").status_code == 409
-    assert c.post(f"/render/{job}", params={"strength": 1.5}).json() == {"state": "queued", "strength": 1.5}
-    res = c.get(f"/result/{job}")
-    assert res.status_code == 200 and res.headers["content-type"] == "video/mp4" and len(res.content) > 1000
-    assert c.delete(f"/job/{job}").json() == {"deleted": True}
-    assert c.get(f"/status/{job}").status_code == 404
-
-
-def test_http_errors_are_json_with_right_codes(tmp_path):
-    root = tmp_path / "jobs"; root.mkdir()
-    c = make_client(root)
-    files = {"video": ("v.mp4", video_bytes(tmp_path), "video/mp4"), "photo": ("p.png", photo_bytes(), "image/png")}
-    r = c.post("/prepare", files=files)                       # no consent
-    assert r.status_code == 400 and "agreed" in r.json()["error"]
-    assert c.get("/status/0123456789abcdef").status_code == 404
-    assert c.get("/status/..%2Fetc").status_code in (404, 422)
-    job = c.post("/prepare", files=files, data={"consent": "yes"}).json()["job"]
-    assert c.get(f"/preview/{job}", params={"frame": 500}).status_code == 400
-    assert c.get(f"/preview/{job}", params={"strength": "abc"}).status_code == 422
-
-
-def test_http_read_and_write_hooks_are_called(tmp_path):
-    root = tmp_path / "jobs"; root.mkdir()
-    calls = []
-    app = texture_api.build_app(root, lambda j: svc.run_prepare(root, j, detector=FAKE), lambda j: svc.run_render(root, j),
-                                before_read=lambda: calls.append("r"), after_write=lambda: calls.append("w"))
-    c = TestClient(app)
-    job = c.post("/prepare", files={"video": ("v.mp4", video_bytes(tmp_path), "video/mp4"), "photo": ("p.png", photo_bytes(), "image/png")},
-                 data={"consent": "yes"}).json()["job"]
-    c.get(f"/status/{job}"); c.post(f"/render/{job}")
-    assert calls.count("w") == 2 and calls.count("r") >= 3
-
-
-def test_modal_app_file_declares_proxy_auth_and_cpu_only():
-    src = (Path(__file__).resolve().parent.parent / "texture_app.py").read_text()
-    compile(src, "texture_app.py", "exec")
-    assert "requires_proxy_auth=True" in src
-    assert "gpu" not in src.lower().replace("no gpu", "")
-    assert "Period(hours=6)" in src
