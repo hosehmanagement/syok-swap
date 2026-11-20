@@ -48,6 +48,9 @@ image = (
     # 0 px and crash preprocess; patch the cell size to at least 1 px (fails this cheap CPU build if Wan's file ever changes)
     .add_local_file(Path(__file__).parent / "patch_wan_mask.py", "/opt/patch_wan_mask.py", copy=True)
     .run_commands("python /opt/patch_wan_mask.py /opt/wan/wan/modules/animate/preprocess/utils.py")
+    # SAM2's own person mask next to Wan's loose grid mask (src_mask_raw.mp4): the tight matte for the two-mask composite
+    .add_local_file(Path(__file__).parent / "patch_wan_raw_mask.py", "/opt/patch_wan_raw_mask.py", copy=True)
+    .run_commands("python /opt/patch_wan_raw_mask.py /opt/wan/wan/modules/animate/preprocess/process_pipepline.py")
     .pip_install("huggingface_hub[hf_transfer]")
     # imported by Wan's package but missing from its requirements files (found when a paid H100 run failed on einops)
     .pip_install("einops", "regex", "safetensors", "librosa", "scipy")
@@ -128,6 +131,8 @@ def _preview_core(sk, d, raw, ref, resolution, margin, start, length, mask_shape
     # Wan's mask can leave the head out (SAM2 body points), which keeps the ORIGINAL head in the background
     head = sk.cover_head_files(d / "proc", sec, shape=mask_shape)
     mask, inverted = sk.normalize_mask(d / "proc" / "src_mask.mp4", d / "mask.mp4")
+    if (d / "proc" / "src_core.mp4").exists():        # the person's own outline + head: the tight matte for the final composite
+        shutil.copy(d / "proc" / "src_core.mp4", d / "core.mp4")
     stats = sk.mask_stats(mask)
     stats["mask_shape"] = mask_shape
     stats["box_mean"] = head["coverage"]["box_mean"]     # what the old box mask would have covered on this clip
@@ -154,6 +159,15 @@ def make_preview(video: bytes, photo: bytes, photo_ext: str, resolution: str, ma
     return meta, (d / "preview.mp4").read_bytes()
 
 
+def _composite(sk, folder, section, gen, mask, out, feather, full_res):
+    """Final clip = ORIGINAL pixels everywhere the new person is not (two-mask composite) when the job has the person's own
+    outline (core.mp4); older jobs fall back to the previous behaviour (Wan's whole frame)."""
+    core = Path(folder) / "core.mp4"
+    if core.exists():
+        return sk.composite_two_mask(section, gen, mask, core, out, feather=feather, full_res=full_res)
+    return sk.composite_over_original(section, gen, mask, out, feather=feather, full_res=full_res)
+
+
 def _render_core(sk, d, relight, feather, full_res, lora, lora_strength):
     """Generate the new person on the GPU, paste it over the ORIGINAL frames, restore the ORIGINAL soundtrack.
     Leaves generated.mp4 and final.mp4 in job folder `d` and returns whether the original had audio."""
@@ -162,8 +176,9 @@ def _render_core(sk, d, relight, feather, full_res, lora, lora_strength):
     w = Path("/tmp/work")
     shutil.rmtree(w, ignore_errors=True)
     shutil.copytree(d / "proc", w / "proc")
-    for name in ("section.mp4", "mask.mp4"):
-        shutil.copy(d / name, w / name)
+    for name in ("section.mp4", "mask.mp4", "core.mp4"):
+        if (d / name).exists():                        # core.mp4 is missing on jobs masked before the two-mask composite
+            shutil.copy(d / name, w / name)
     import cv2
     # Inside generate.py, cv2.imread of a PNG dies with "libpng error: bad parameters to zlib" (a zlib clash with another
     # library loaded in that process). cv2.imread picks the decoder from the file CONTENT, so store the reference as BMP
@@ -191,7 +206,7 @@ def _render_core(sk, d, relight, feather, full_res, lora, lora_strength):
     if r.returncode:
         raise RuntimeError("generate failed:\n" + (r.stdout + r.stderr)[-2500:])
     comp = w / "composite.mp4"
-    sk.composite_over_original(w / "section.mp4", gen, w / "mask.mp4", comp, feather=feather, full_res=full_res)
+    _composite(sk, w, w / "section.mp4", gen, w / "mask.mp4", comp, feather, full_res)
     final, had_audio = sk.mux_original_audio(comp, w / "section.mp4", w / "final.mp4")
     shutil.copy(gen, d / "generated.mp4")
     shutil.copy(final, d / "final.mp4")
@@ -361,7 +376,7 @@ def recomposite_job(job: str, feather: int = 7):
     shutil.rmtree(w, ignore_errors=True)
     w.mkdir()
     comp = w / "composite.mp4"
-    sk.composite_over_original(d / "section.mp4", d / "generated.mp4", d / "mask.mp4", comp, feather=feather, full_res=True)
+    _composite(sk, d, d / "section.mp4", d / "generated.mp4", d / "mask.mp4", comp, feather, True)
     final, _ = sk.mux_original_audio(comp, d / "section.mp4", w / "final_full.mp4")
     shutil.copy(final, d / "final_full.mp4")
     cache.commit()

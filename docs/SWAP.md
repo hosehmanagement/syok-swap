@@ -25,7 +25,7 @@ The endpoint refuses every request without your proxy token (`requires_proxy_aut
    prepares the slider again on a finished swap, CPU only.
 5. `GET /status/{job}`, `DELETE /job/{job}`, `GET /health`, `POST /setup`.
 
-## Mask shape: silhouette (default) or box
+## Mask shape: silhouette (default), blocky or box
 
 **What was wrong (reported 20 Nov 2026 from a live mask check):** the red "will be replaced" area was a wide rectangle around
 the person (the hedge on both sides of the body was inside it) plus another rectangle over the head. Wan redraws everything
@@ -130,3 +130,27 @@ collage and draw two people, or a split image. Leave it off unless you are testi
   `status.collage` = `{"face": N, "of": M}` says which added photo was used. `GET /health` reports `"collage": true`.
 
 Limits: video up to 60 MB, photo up to 8 MB, section up to 30 s. Clothes come from the reference photo.
+
+## Two masks and the original background (20 Nov 2026)
+
+**What was wrong:** `composite_over_original` had been switched to "use Wan's whole frame" (blend_original=False, 18 Nov), so the
+final clip's background was Wan's re-encoded copy, not the camera's. Wan sends every frame through its VAE, which shifts colour
+and redraws textures (a hedge gets other leaves) in every 77-frame chunk. The red mask size was only part of the problem.
+
+**What it does now** (`swapkit.composite_two_mask`, used by the render and `recomposite_job` when the job has `core.mp4`):
+- Wan redraws inside the loose grid mask (`src_mask`). A build patch (`patch_wan_raw_mask.py`) makes Wan also save SAM2's own
+  person mask (`src_mask_raw.mp4`); `cover_head_files` adds the head to it and writes `src_core.mp4`, saved in the job as
+  `core.mp4`: the old person's outline, tight.
+- The generated frame is colour-matched (per-channel gain and bias, smoothed over time) to the original on the pixels well outside
+  the mask, which removes the VAE's exposure shift.
+- Final pixel = generated inside the core (grown 1.2% of the frame); original outside the grid mask; in the ring between them
+  (grid cells that hold background, or a new body wider than the old one) generated ONLY where its colour at low detail differs
+  from the original (a body against a hedge). A hedge Wan merely redrew keeps its original leaves. Feathered edge (default 7).
+- Jobs masked before this change have no `core.mp4` and render as before.
+- `mask_shape=blocky` (grid 6 x 12) is a coarser grid for more freedom of body shape (Wan's guide and two papers: a very exact
+  mask makes the new person copy the old outline). It is not the default, because the red preview would then show more than
+  before; try it with the mask check.
+
+**NOT measured:** tested only on synthetic frames. Unknown on real footage: how the colour-difference test behaves with similar
+colours (a green dress against a hedge), and with fast motion. `recomposite_job` rebuilds a finished render on the CPU for free,
+so the same generated.mp4 can be re-composited with other settings.

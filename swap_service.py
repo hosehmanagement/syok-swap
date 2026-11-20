@@ -97,7 +97,7 @@ def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", marg
         raise JobError("Margin must be tight, normal or loose.")
     mask_shape = (mask_shape or sk.DEFAULT_MASK_SHAPE).strip().lower()
     if mask_shape not in sk.MASK_SHAPES:
-        raise JobError("Mask shape must be silhouette or box.")
+        raise JobError("Mask shape must be silhouette, blocky or box.")
     start, length = _num(start, "Start"), _num(length, "Length")
     uploads = face_uploads(faces, face, face_ext)
     if collage and not uploads:

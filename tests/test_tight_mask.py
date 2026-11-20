@@ -267,7 +267,7 @@ def test_mask_shape_in_the_job_request(tmp_path):
     from test_swap_service import Rig
     r = Rig(tmp_path)
     h = r.c.get("/health").json()
-    assert h["mask_shapes"] == ["box", "silhouette"] and h["mask_shape"] == "silhouette"
+    assert h["mask_shapes"] == ["blocky", "box", "silhouette"] and h["mask_shape"] == "silhouette"
     job = r.upload().json()["job"]
     assert "mask_shape" not in ss.request_of(r.root, job)                 # default: silhouette, request as before
     job = r.upload(mask_shape="Box").json()["job"]
