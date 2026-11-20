@@ -30,11 +30,12 @@ Wan2.2-Animate redraws the whole person from one photo, so the face is close but
 Face-lock is an optional second pass after the swap: Magic Hour's "Face swap video" API puts the exact face from the photo
 onto the swapped clip. Then the realism slider is prepared on the face-locked clip as usual.
 
-- **Only when you tick the box.** `POST /swap` with `facelock=yes` (and optionally `face`, a clear front-facing close-up of the
-  same person, png/jpg/webp up to 8 MB; without it the main photo is used). Nothing is sent to Magic Hour otherwise.
+- **Only when you tick the box.** `POST /swap` with `facelock=yes` (and optionally up to 5 `face` photos of the same person,
+  see "Best-photo pick" below; without them the main photo is used). Nothing is sent to Magic Hour otherwise.
 - After the swap, `status.facelock.state` is `waiting` and the slider is not prepared yet (the clip is about to change).
-  `POST /facelock/{job}` with the header `X-Magic-Hour-Key: <your key>` (optional `face` file) sends the swapped clip and the
-  face photo to Magic Hour and puts the result back in place. `POST /facelock/{job}/skip` uses the swap as it is.
+  `POST /facelock/{job}` with the header `X-Magic-Hour-Key: <your key>` (optional `face` files, which replace the earlier pick)
+  sends the swapped clip and the chosen face photo to Magic Hour and puts the result back in place.
+  `POST /facelock/{job}/skip` uses the swap as it is.
 - **Credits come from your own Magic Hour account** (magichour.ai > Developer for the key). Commercial use is covered by Magic
   Hour's paid plans. `status.facelock.credits` shows what Magic Hour charged; Magic Hour refunds a job that fails on their side.
   The job is created once and never retried automatically, so a retry is always your click.
@@ -42,8 +43,34 @@ onto the swapped clip. Then the realism slider is prepared on the face-locked cl
 - **Free plan:** Magic Hour limits face swap videos to 576 px on the longest edge. The result is scaled back to the swapped
   clip's size and `status.facelock.note` says so; a paid plan keeps more detail.
 - **Photo:** Magic Hour asks for a face area of at least 512 x 512 px. A face under about 256 px wide does not block anything,
-  but `status.facelock.warning` suggests a sharper head-and-shoulders close-up.
+  but `status.facelock.warning` suggests a sharper head-and-shoulders close-up (also when every photo you added is under
+  256 px, or none of them shows a face; then the main photo is used).
 - If face-lock fails, the swapped clip is untouched and the slider still works on it; try again or skip. The swap as Wan made
   it is kept as `src_plain.mp4` in the job folder (removed with the job after 3 days).
-- States: `idle`, `waiting`, `queued`, `working`, `done`, `error`, `skipped` (plus `message`, `credits`, `warning`, `note`).
+- States: `idle`, `waiting`, `queued`, `working`, `done`, `error`, `skipped` (plus `message`, `credits`, `warning`, `note`, `pick`).
+
+### Best-photo pick (picker.py)
+Magic Hour copies the face from ONE photo. You may add several (a full-body shot, a side profile, a close-up...) and the
+code picks the one it can copy best.
+
+- The multipart field `face` may repeat **1 to 5 times** on `POST /swap` and `POST /facelock/{job}`: png/jpg/webp, each up to
+  8 MB, **all together up to 12 MB** (else 400 with a plain message, nothing stored). Empty file parts are ignored.
+  `GET /health` reports `limits.faces` (5) and `limits.faces_mb` (12).
+- The **main photo is always one more candidate**. Numbering: your added photos in upload order, then the main photo last.
+  One added photo is simply a 2-way pick (that photo or the main photo).
+- The winner is stored as `face.<ext>` (a copy of the main photo when it wins); the other candidates are deleted, never kept.
+  `status.facelock.pick` = `{"chosen": N, "of": M, "reason": "Using photo 2: front-facing and about 640 px wide.",
+  "scores": [{"n", "face_px", "front", "sharp", "ok", "note", "score"}]}` (N is 1-based; `ok` = the face is neither too dark
+  nor too bright; `note` is a short plain-English description; `score` is the number below).
+- If **no photo has a face**, nothing is blocked: the main photo is used, `pick.chosen` is the main photo and the warning says so.
+- How it scores, from the largest face YuNet finds in each photo (exact formulas in picker.py's docstring):
+  - `face_px` = face box width; `S = min(face_px, 512) / 512`.
+  - `front` (0..1) from the 5 landmarks: nose and mouth centred between the eyes (and eyes level, a small share); below 0.35
+    it counts as a profile.
+  - `sharp` (0..1) = variance of the Laplacian of the face resized to 128 x 128, divided by the crop's own variance (floor 100),
+    divided by 0.15, capped at 1.
+  - `E` = 1 when the face's mean brightness is 60-200, less outside (never below 0.5); `M` = 0.6 when another face at least
+    40% as wide is in the photo (which person to copy would be ambiguous).
+  - `score = S^1.5 x front x (0.4 + 0.6 x sharp) x E x M`. A profile never beats a photo that is not a profile; equal scores
+    go to the larger face, then to the earlier photo. Photos without a face are never chosen.
 Limits: video up to 60 MB, photo up to 8 MB, section up to 30 s. Clothes come from the reference photo.

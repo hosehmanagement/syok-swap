@@ -4,10 +4,13 @@ Routes (all behind Modal's proxy token when deployed):
     GET    /health                 -> {"ok": true, "app": "syok-swap", "weights": "ready|downloading|missing", ...}   free check
     POST   /setup                  one-time: download the model files into the user's Modal volume (starts it if missing)
     POST   /swap                   multipart: video, photo, consent=yes, resolution, margin, start, length, optional skin,
-                                   optional face (close-up for face-lock), facelock=yes|""
-                                   -> {"job", "estimate"}. Refused (422, nothing charged) when the photo cannot feed the
+                                   optional face (1 to 5 candidate photos for face-lock: repeat the field; each png/jpg/
+                                   webp <= photo_mb, all together <= faces_mb, else 400), facelock=yes|""
+                                   -> {"job", "estimate"}. The best of the face photos and the main photo is kept
+                                   (picker.py); status facelock.pick says which and why. Refused (422, nothing charged) when the photo cannot feed the
                                    realism slider. (the mask step starts at once on a small GPU: cents)
-    POST   /facelock/{job}         header X-Magic-Hour-Key (the user's own key; never stored or logged), optional multipart face.
+    POST   /facelock/{job}         header X-Magic-Hour-Key (the user's own key; never stored or logged), optional multipart face
+                                   (1 to 5, same rules as /swap; the main photo is again a candidate; replaces the earlier pick).
                                    Puts the exact face from the photo onto the swapped clip with Magic Hour (the user's credits),
                                    then prepares the slider again. -> {"facelock": {"state": "queued"}}
     POST   /facelock/{job}/skip    use the swap as it is (while face-lock waits or after it failed); the slider is prepared
@@ -23,8 +26,9 @@ Routes (all behind Modal's proxy token when deployed):
     DELETE /job/{job}
 """
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
+import picker
 import swap_service as ss
 import texture_service as svc
 import texture_transfer as tt
@@ -32,11 +36,26 @@ import texture_transfer as tt
 
 def build_app(root, spawn_mask, spawn_swap, spawn_render, spawn_weights, weights_state,
               before_read=lambda: None, after_write=lambda: None, spawn_prepare=lambda job: None, detector=tt.detect_face,
-              spawn_facelock=lambda job, key: None):
+              spawn_facelock=lambda job, key: None, face_detector=None):
     from fastapi import FastAPI, File, Form, Header, UploadFile
     from fastapi.responses import FileResponse, JSONResponse, Response
 
     app = FastAPI(title="Syok Swap", docs_url=None, redoc_url=None)
+
+    async def _read_faces(files):
+        """The repeated `face` field as [(bytes, ext)]. Stops reading past the limits so a huge upload is refused early."""
+        out, total = [], 0
+        for f in files or []:
+            if f is None:
+                continue
+            data = await f.read(svc.MAX_PHOTO_BYTES + 1)
+            if not data:
+                continue
+            total += len(data)
+            out.append((data, Path(f.filename or "").suffix))
+            if len(out) > picker.MAX_CANDIDATES or total > picker.MAX_TOTAL_BYTES:
+                break                                   # face_uploads() refuses it with the plain message
+        return out
 
     @app.exception_handler(svc.JobError)
     async def _job_error(request, exc):
@@ -48,7 +67,8 @@ def build_app(root, spawn_mask, spawn_swap, spawn_render, spawn_weights, weights
         return {"ok": True, "app": "syok-swap", "version": 3, "weights": weights_state(), "facelock": True,
                 "strength": {"min": tt.MIN_STRENGTH, "max": tt.MAX_STRENGTH, "start": tt.DEFAULT_STRENGTH},
                 "limits": {"video_mb": svc.MAX_VIDEO_BYTES // 2**20, "photo_mb": svc.MAX_PHOTO_BYTES // 2**20,
-                           "seconds": int(svc.sk.MAX_SECONDS), "keep_days": svc.JOB_TTL_SECONDS // 86400}}
+                           "seconds": int(svc.sk.MAX_SECONDS), "keep_days": svc.JOB_TTL_SECONDS // 86400,
+                           "faces": picker.MAX_CANDIDATES, "faces_mb": picker.MAX_TOTAL_BYTES // 2**20}}
 
     @app.post("/setup")
     def setup():
@@ -62,17 +82,17 @@ def build_app(root, spawn_mask, spawn_swap, spawn_render, spawn_weights, weights
     @app.post("/swap")
     async def swap(video: UploadFile = File(...), photo: UploadFile = File(...), consent: str = Form(""),
                    resolution: str = Form("480p"), margin: str = Form("normal"), start: str = Form("0"), length: str = Form("0"),
-                   skin: Optional[UploadFile] = File(None), face: Optional[UploadFile] = File(None), facelock: str = Form("")):
+                   skin: Optional[UploadFile] = File(None), face: Optional[List[UploadFile]] = File(None),
+                   facelock: str = Form("")):
         before_read()
         if weights_state() != "ready":
             raise svc.JobError("One-time setup is not finished: the model files are not on your Modal account yet.", 409)
         skin_bytes = (await skin.read()) if skin is not None else None
-        face_bytes = (await face.read()) if face is not None else None
+        faces = await _read_faces(face)
         job = ss.new_swap_job(root, await video.read(), await photo.read(), Path(photo.filename or "").suffix, consent,
                               resolution, margin, start, length,
                               skin=skin_bytes or None, skin_ext=Path((skin.filename if skin is not None else "") or "").suffix,
-                              detector=detector, face=face_bytes or None,
-                              face_ext=Path((face.filename if face is not None else "") or "").suffix,
+                              detector=detector, faces=faces, face_detector=face_detector,
                               facelock=(facelock or "").strip().lower() == "yes")
         after_write()
         spawn_mask(job)
@@ -88,12 +108,11 @@ def build_app(root, spawn_mask, spawn_swap, spawn_render, spawn_weights, weights
         return {"job": job, "prepare": {"state": "queued"}}
 
     @app.post("/facelock/{job}")
-    async def facelock_start(job: str, face: Optional[UploadFile] = File(None),
+    async def facelock_start(job: str, face: Optional[List[UploadFile]] = File(None),
                              x_magic_hour_key: Optional[str] = Header(None)):
         before_read()
-        face_bytes = (await face.read()) if face is not None else None
-        ss.start_facelock(root, job, x_magic_hour_key, face_bytes or None,
-                          Path((face.filename if face is not None else "") or "").suffix, detector=detector)
+        faces = await _read_faces(face)
+        ss.start_facelock(root, job, x_magic_hour_key, detector=detector, faces=faces, face_detector=face_detector)
         after_write()
         try:
             spawn_facelock(job, x_magic_hour_key.strip())          # the only place the key goes; never into meta or a log

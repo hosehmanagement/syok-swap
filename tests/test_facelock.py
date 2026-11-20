@@ -97,7 +97,7 @@ class FaceRig(Rig):
     """The swap API wired like app.py: the swap stops at face-lock "waiting", POST /facelock runs the fake Magic Hour, and the
     slider preparation runs whenever the service says to spawn it."""
 
-    def __init__(self, tmp_path, mh=None, detector=FAKE):
+    def __init__(self, tmp_path, mh=None, detector=FAKE, face_detector=None):
         super().__init__(tmp_path)
         import swap_api
         from fastapi.testclient import TestClient
@@ -105,7 +105,8 @@ class FaceRig(Rig):
         self.facelock_calls = []
         self.clock = Clock()
         app = swap_api.build_app(self.root, self.mask, self.swap, self.render, self.fetch_weights, lambda: self.weights,
-                                 spawn_prepare=self.prepare, detector=detector, spawn_facelock=self.facelock)
+                                 spawn_prepare=self.prepare, detector=detector, spawn_facelock=self.facelock,
+                                 face_detector=face_detector)
         self.c = TestClient(app)
 
     def swap(self, job):

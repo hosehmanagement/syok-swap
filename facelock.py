@@ -15,7 +15,8 @@ The Magic Hour calls mirror syok-ai-router/src/effects.ts exactly (docs: https:/
     GET  /v1/video-projects/{id}      -> { status, downloads:[{url}], error:{message, code}, credits_charged }
 
 Files in the job folder:  src_plain.mp4 (the swap as Wan made it, kept for good)   src.mp4 (replaced by the face-locked clip)
-                          face.<ext> (optional close-up; otherwise ref.<ext> is sent)
+                          face.<ext> (the photo picker.py chose from the user's candidates and the main photo;
+                                      when it is absent, e.g. no photo had a face, ref.<ext> is sent)
 
 The key is a function argument only: it is never written to meta.json or any file, never logged, and scrubbed from every
 message that is stored or raised.
@@ -333,7 +334,8 @@ def build_locked_clip(result, plain, out, work):
 # ------------------------------------------------------------------ the job
 
 def face_photo(d, meta):
-    """The photo whose face Magic Hour copies: the optional face close-up, else the photo that drove the swap."""
+    """The photo whose face Magic Hour copies: the one the best-photo pick kept (meta["face"]), else the photo that drove
+    the swap."""
     return d / (meta.get("face") or meta["ref"])
 
 
