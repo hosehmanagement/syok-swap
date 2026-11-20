@@ -1,4 +1,4 @@
-# Syok Swap on your own Modal (swap + texture slider, one flow)
+# Syok Swap on your own Modal (swap + texture slider + optional face-lock, one flow)
 
 One Modal app (`app.py`, name `syok-swap`). Modal bills YOUR account. Idle costs nothing. Results are removed after 3 days.
 Every swap result has the texture strength slider (0 to 3, starts at 2.0) built in: there is no separate texture step.
@@ -24,4 +24,26 @@ The endpoint refuses every request without your proxy token (`requires_proxy_aut
    close-up, and refuses (422, nothing charged) a photo that cannot feed the slider. `POST /retexture/{job}` (optional `skin`)
    prepares the slider again on a finished swap, CPU only.
 5. `GET /status/{job}`, `DELETE /job/{job}`, `GET /health`, `POST /setup`.
+
+## Face-lock (optional, uses YOUR Magic Hour account)
+Wan2.2-Animate redraws the whole person from one photo, so the face is close but not exactly the person in the photo.
+Face-lock is an optional second pass after the swap: Magic Hour's "Face swap video" API puts the exact face from the photo
+onto the swapped clip. Then the realism slider is prepared on the face-locked clip as usual.
+
+- **Only when you tick the box.** `POST /swap` with `facelock=yes` (and optionally `face`, a clear front-facing close-up of the
+  same person, png/jpg/webp up to 8 MB; without it the main photo is used). Nothing is sent to Magic Hour otherwise.
+- After the swap, `status.facelock.state` is `waiting` and the slider is not prepared yet (the clip is about to change).
+  `POST /facelock/{job}` with the header `X-Magic-Hour-Key: <your key>` (optional `face` file) sends the swapped clip and the
+  face photo to Magic Hour and puts the result back in place. `POST /facelock/{job}/skip` uses the swap as it is.
+- **Credits come from your own Magic Hour account** (magichour.ai > Developer for the key). Commercial use is covered by Magic
+  Hour's paid plans. `status.facelock.credits` shows what Magic Hour charged; Magic Hour refunds a job that fails on their side.
+  The job is created once and never retried automatically, so a retry is always your click.
+- Your key is used for that one job only: it is not saved in the job folder, the status or any log.
+- **Free plan:** Magic Hour limits face swap videos to 576 px on the longest edge. The result is scaled back to the swapped
+  clip's size and `status.facelock.note` says so; a paid plan keeps more detail.
+- **Photo:** Magic Hour asks for a face area of at least 512 x 512 px. A face under about 256 px wide does not block anything,
+  but `status.facelock.warning` suggests a sharper head-and-shoulders close-up.
+- If face-lock fails, the swapped clip is untouched and the slider still works on it; try again or skip. The swap as Wan made
+  it is kept as `src_plain.mp4` in the job folder (removed with the job after 3 days).
+- States: `idle`, `waiting`, `queued`, `working`, `done`, `error`, `skipped` (plus `message`, `credits`, `warning`, `note`).
 Limits: video up to 60 MB, photo up to 8 MB, section up to 30 s. Clothes come from the reference photo.
