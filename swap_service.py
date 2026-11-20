@@ -21,7 +21,15 @@ as it is. Either way the slider is then prepared on whatever src.mp4 is.
 
 Files:  raw.mp4 (original clip)  ref.<ext> (new person)  preview.mp4 / mask.mp4 / section.mp4 / proc/ (mask step)
         generated.mp4 (raw generation)  src.mp4 (swapped clip)  layer.npy, tracks.json, prepared.json (slider)  final.mp4 (result)
-        face.<ext> (optional face close-up for face-lock)  src_plain.mp4 (the swap before face-lock, kept)
+        face.<ext> (the photo face-lock sends to Magic Hour, chosen by picker.py)  src_plain.mp4 (the swap before face-lock, kept)
+
+Best-photo pick: POST /swap and POST /facelock/{job} take the multipart field `face` 1 to 5 times (png/jpg/webp, each at most
+MAX_PHOTO_BYTES, all together at most 12 MB). The main photo ref.<ext> is always one more candidate. picker.py scores them
+(face size, then how front-facing, then sharpness, then exposure; one person only) and the winner is stored as face.<ext>
+(a copy of ref.<ext> when the main photo wins) and meta["face"]; the other candidates are deleted, never kept. The result is
+meta["facelock"]["pick"] = {"chosen": N (1-based), "of": M, "reason": str, "scores": [{"n", "face_px", "front", "sharp",
+"ok", "note", "score"}]}. Numbering: the added photos in upload order, then the main photo last (N = M). When no photo has a
+face the main photo is used (no face.<ext>) and the warning says so; nothing is ever blocked by the pick.
 """
 import os
 import shutil
@@ -30,6 +38,7 @@ from pathlib import Path
 
 import cv2
 
+import picker
 import swapkit as sk
 import texture_transfer as tt
 import texture_service as tsvc
@@ -64,9 +73,11 @@ def _num(v, name):
 
 
 def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", margin="normal", start=0.0, length=0.0,
-                 skin=None, skin_ext="", detector=tt.detect_face, face=None, face_ext="", facelock=False):
+                 skin=None, skin_ext="", detector=tt.detect_face, face=None, face_ext="", facelock=False, faces=None,
+                 face_detector=None):
     """Store the original clip and the new person's photo. Returns the job id; the mask step then runs on a small GPU.
-    `face` is an optional close-up for face-lock, `facelock` asks for the face-lock pass after the swap."""
+    `faces` is a list of (bytes, ext) candidate photos for face-lock (`face`/`face_ext` is the one-photo form); the best of
+    them and the main photo is kept (picker.py). `facelock` asks for the face-lock pass after the swap."""
     resolution = resolution or "480p"
     margin = margin or "normal"
     if resolution not in sk.RESOLUTIONS:
@@ -74,7 +85,7 @@ def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", marg
     if margin not in sk.MARGINS:
         raise JobError("Margin must be tight, normal or loose.")
     start, length = _num(start, "Start"), _num(length, "Length")
-    fext = _face_ext(face, face_ext)
+    uploads = face_uploads(faces, face, face_ext)
     job = tsvc.new_job(root, video, photo, photo_ext, consent, video_name="raw.mp4", skin=skin, skin_ext=skin_ext)
     d = tsvc.job_dir(root, job)
     try:
@@ -90,10 +101,9 @@ def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", marg
         meta.update(kind="swap", request=request,
                     mask={"state": "queued"}, swap={"state": "idle"}, prepare={"state": "idle"},
                     facelock={"state": "idle"}, estimate=estimate(resolution, l))
-        if face:
-            (d / f"face{fext}").write_bytes(face)
-            meta["face"] = f"face{fext}"
-        if face or facelock:
+        if uploads:
+            pick_face(d, meta, uploads, _picker_detector(detector, face_detector))
+        elif facelock:
             _set_facelock_warning(d, meta, detector)
         tsvc.write_meta(d, meta)
     except Exception:
@@ -117,6 +127,84 @@ def _face_ext(face, face_ext):
     return ext
 
 
+def face_uploads(faces=None, face=None, face_ext=""):
+    """Check the candidate face photos BEFORE anything is stored: 1 to 5 non-empty files (empty parts, as a browser form sends
+    for an unused file field, are ignored), each png/jpg/webp and at most MAX_PHOTO_BYTES, all together at most 12 MB.
+    Returns [(bytes, ext)]."""
+    items = list(faces or [])
+    if face:
+        items.insert(0, (face, face_ext))
+    items = [(b, e) for b, e in items if b]
+    if len(items) > picker.MAX_CANDIDATES:
+        raise JobError(f"Add at most {picker.MAX_CANDIDATES} face photos.")
+    out = [(b, _face_ext(b, e)) for b, e in items]
+    if sum(len(b) for b, _ in out) > picker.MAX_TOTAL_BYTES:
+        raise JobError(f"The face photos together are larger than {picker.MAX_TOTAL_BYTES // 2**20} MB.")
+    return out
+
+
+def _picker_detector(detector, face_detector):
+    """The picker's detector: given, else YuNet in production, else the injected (box, weight) detector (tests' fakes)."""
+    if face_detector is not None:
+        return face_detector
+    return picker.yunet_faces if detector is tt.detect_face else picker.from_box_detector(detector)
+
+
+def pick_face(d, meta, uploads, face_detector):
+    """Store the candidates, keep the best as face.<ext> (or nothing when the main photo has to be used), delete the rest,
+    and record the pick and its warning in meta (not written here). Replaces any face photo from before."""
+    cands = []
+    try:
+        for i, (data, ext) in enumerate(uploads):
+            p = d / f"face_cand{i + 1}{ext}"
+            p.write_bytes(data)
+            cands.append(p)
+        ref = d / meta["ref"]
+        paths = cands + [ref]
+        m = len(paths)
+        labels = [f"photo {i + 1}" for i in range(m - 1)] + [f"photo {m} (your main photo)"]
+        res = picker.pick([picker.read_image(p) for p in paths], face_detector, labels)
+        if meta.get("face"):
+            (d / meta["face"]).unlink(missing_ok=True)
+            meta.pop("face", None)
+        chosen = res["chosen"]
+        if chosen is not None:
+            src = paths[chosen - 1]
+            dest = d / f"face{src.suffix.lower()}"
+            if src == ref:
+                tmp = d / "face.tmp"
+                shutil.copyfile(ref, tmp)
+                tmp.replace(dest)
+            else:
+                src.replace(dest)
+            meta["face"] = dest.name
+    finally:
+        for p in cands:
+            p.unlink(missing_ok=True)
+    meta.setdefault("facelock", {})["pick"] = {"chosen": chosen if chosen is not None else m, "of": m,
+                                               "reason": res["reason"], "scores": res["scores"]}
+    _store_warning(meta, pick_warning(res))
+
+
+def pick_warning(res):
+    """The face-lock warning after a pick, from the CHOSEN photo's face (or None)."""
+    m = res["of"]
+    if res["chosen"] is None:
+        return (f"We could not find a clear face in any of your {m} photos, so your main photo is used and Magic Hour may not "
+                "find a face either. Add a sharp head-and-shoulders close-up for a closer likeness.")
+    width = res["scores"][res["chosen"] - 1]["face_px"]
+    if res["all_small"]:
+        return (f"Every photo you added shows the face under {FACELOCK_MIN_FACE_PX} px wide: the best one is only about "
+                f"{width} px wide, so Magic Hour has little to copy. Add a sharp head-and-shoulders close-up for a closer "
+                "likeness. Magic Hour asks for a face area of at least 512 x 512 px.")
+    return _small_face_text(width) if width < FACELOCK_MIN_FACE_PX else None
+
+
+def _small_face_text(width):
+    return (f"The face in your photo is only about {width} px wide, so Magic Hour has little to copy. Add a sharp "
+            "head-and-shoulders close-up for a closer likeness. Magic Hour asks for a face area of at least 512 x 512 px.")
+
+
 def facelock_warning(photo_path, detector=tt.detect_face):
     """A plain-English warning when the face Magic Hour would copy is small (or not found), else None. Never blocks."""
     img = cv2.imread(str(photo_path))
@@ -132,12 +220,14 @@ def facelock_warning(photo_path, detector=tt.detect_face):
     width = int(round(float(box[2])))
     if width >= FACELOCK_MIN_FACE_PX:
         return None
-    return (f"The face in your photo is only about {width} px wide, so Magic Hour has little to copy. Add a sharp "
-            "head-and-shoulders close-up for a closer likeness. Magic Hour asks for a face area of at least 512 x 512 px.")
+    return _small_face_text(width)
 
 
 def _set_facelock_warning(d, meta, detector):
-    w = facelock_warning(d / (meta.get("face") or meta["ref"]), detector)
+    _store_warning(meta, facelock_warning(d / (meta.get("face") or meta["ref"]), detector))
+
+
+def _store_warning(meta, w):
     if w:
         meta["facelock_warning"] = w
         meta.setdefault("facelock", {})["warning"] = w
@@ -242,9 +332,10 @@ def finish_swap(root, job, final_path, had_audio):
 FACELOCK_KEY_MIN = 8
 
 
-def start_facelock(root, job, key, face=None, face_ext="", detector=tt.detect_face):
+def start_facelock(root, job, key, face=None, face_ext="", detector=tt.detect_face, faces=None, face_detector=None):
     """Check face-lock may start now and queue it. The key is only checked here, never stored: the caller passes it straight to
-    the spawned function. Optional `face` stores or replaces the face close-up first."""
+    the spawned function. Optional `faces` (list of (bytes, ext); `face` is the one-photo form) are new candidates: the best
+    of them and the main photo replaces the face photo from before."""
     if not isinstance(key, str) or len(key.strip()) < FACELOCK_KEY_MIN:
         raise JobError("Connect your Magic Hour key first.", 400)
     d = tsvc.job_dir(root, job)
@@ -259,13 +350,9 @@ def start_facelock(root, job, key, face=None, face_ext="", detector=tt.detect_fa
         raise JobError("The slider is being prepared. Wait for it to finish, then lock the face.", 409)
     if meta.get("render", {}).get("state") in ("queued", "rendering"):
         raise JobError("A render is running. Wait for it to finish.", 409)
-    if face:
-        ext = _face_ext(face, face_ext)
-        if meta.get("face"):
-            (d / meta["face"]).unlink(missing_ok=True)
-        (d / f"face{ext}").write_bytes(face)
-        meta["face"] = f"face{ext}"
-        _set_facelock_warning(d, meta, detector)
+    uploads = face_uploads(faces, face, face_ext)
+    if uploads:
+        pick_face(d, meta, uploads, _picker_detector(detector, face_detector))
         tsvc.write_meta(d, meta)
     tsvc.set_stage(d, "facelock", state="queued", message=None, note=None, credits=None, started=time.time())
 

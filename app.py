@@ -57,6 +57,7 @@ image = (
     .add_local_file(Path(__file__).parent / "texture_transfer.py", "/opt/texture_transfer.py")
     .add_local_file(Path(__file__).parent / "texture_service.py", "/opt/texture_service.py")
     .add_local_file(Path(__file__).parent / "swap_service.py", "/opt/swap_service.py")
+    .add_local_file(Path(__file__).parent / "picker.py", "/opt/picker.py")            # swap_service imports it
     .add_local_file(Path(__file__).parent / "lora" / "face_detection_yunet_2023mar.onnx", "/opt/face_detection_yunet_2023mar.onnx")  # head detection for the mask
     .add_local_python_source("lora")   # lora/merge.py: merge an identity LoRA into the base weights at render time
 )
@@ -73,6 +74,8 @@ light = (
     .add_local_file(HERE / "swap_service.py", "/opt/swap_service.py")
     .add_local_file(HERE / "swap_api.py", "/opt/swap_api.py")
     .add_local_file(HERE / "facelock.py", "/opt/facelock.py")
+    .add_local_file(HERE / "picker.py", "/opt/picker.py")              # best-photo pick for face-lock
+    .add_local_file(HERE / "lora" / "face_detection_yunet_2023mar.onnx", "/opt/face_detection_yunet_2023mar.onnx")  # its detector
 )
 WEIGHTS_FLAGS = "/cache"      # .weights-downloading / .weights-ok live next to the model folder
 
