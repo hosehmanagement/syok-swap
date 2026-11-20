@@ -2,6 +2,7 @@
 
 A SEPARATE Modal app ("syok-swap-h3") with its own two Volumes; the Wan engine (app.py, "syok-swap") is not touched.
 NOTHING HERE HAS BEEN RUN ON MODAL YET. See docs/H3.md for every unverified item before the first deploy.
+The web endpoint (web(), h3_api.py) is the one the Syok router calls; it has not been deployed yet either.
 
     modal run h3_app.py::fetch                                 # once: model files into the syok-h3-models Volume (see docs)
     modal run h3_app.py::new --video v.mp4 --photo p.png --consent yes [--margin normal --start 0 --length 6 --seed 0 --resolution 480p]
@@ -97,9 +98,11 @@ image = (
 light = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("ffmpeg", "libgl1", "libglib2.0-0")
-    .pip_install("numpy<2", "opencv-python-headless<5", "huggingface_hub[hf_transfer]")
+    .pip_install("numpy<2", "opencv-python-headless<5", "huggingface_hub[hf_transfer]", "fastapi[standard]")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
     .add_local_file(HERE / "h3_engine.py", "/opt/syok/h3_engine.py")
+    .add_local_file(HERE / "h3_api.py", "/opt/syok/h3_api.py")                       # the web endpoint (web() below)
+    .add_local_file(HERE / "h3_territory.py", "/opt/syok/h3_territory.py")           # the licence territory gate
     .add_local_file(HERE / "texture_service.py", "/opt/syok/texture_service.py")
     .add_local_file(HERE / "texture_transfer.py", "/opt/syok/texture_transfer.py")
     .add_local_file(HERE / "swapkit.py", "/opt/syok/swapkit.py")
@@ -234,21 +237,27 @@ def fetch_models(sources: dict):
     eng = _eng()
     from huggingface_hub import hf_hub_download
     src = eng.resolve_sources(sources)
-    got = []
-    for m in eng.MODEL_FILES:
-        dest = Path(MODELS) / m["folder"] / m["file"]
-        if dest.is_file():
-            got.append(f"{m['folder']}/{m['file']} (already there)")
-            continue
-        s = src[m["file"]]
-        tmp = Path(MODELS) / ".partial"
-        p = Path(hf_hub_download(s["repo_id"], s["path_in_repo"], revision=s.get("revision"), local_dir=str(tmp)))
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(p), dest)
-        models.commit()
-        got.append(f"{m['folder']}/{m['file']}")
-    shutil.rmtree(Path(MODELS) / ".partial", ignore_errors=True)
+    flag = Path(MODELS) / eng.FETCH_FLAG             # lets the web endpoint say "downloading" (h3_engine.weights_state)
+    flag.write_text(str(time.time()))
     models.commit()
+    got = []
+    try:
+        for m in eng.MODEL_FILES:
+            dest = Path(MODELS) / m["folder"] / m["file"]
+            if dest.is_file():
+                got.append(f"{m['folder']}/{m['file']} (already there)")
+                continue
+            s = src[m["file"]]
+            tmp = Path(MODELS) / ".partial"
+            p = Path(hf_hub_download(s["repo_id"], s["path_in_repo"], revision=s.get("revision"), local_dir=str(tmp)))
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(p), dest)
+            models.commit()
+            got.append(f"{m['folder']}/{m['file']}")
+        shutil.rmtree(Path(MODELS) / ".partial", ignore_errors=True)
+    finally:
+        flag.unlink(missing_ok=True)                 # a failed fetch reads as "missing" again, so /setup can retry it
+        models.commit()
     return got
 
 
@@ -304,6 +313,29 @@ def sweep_old_jobs():
     n = eng.tsvc.sweep(JOBS)
     jobs.commit()
     return n
+
+
+@app.function(image=light, volumes={MODELS: models, JOBS: jobs}, cpu=2, timeout=600, max_containers=3)
+@modal.concurrent(max_inputs=4)
+@modal.asgi_app(requires_proxy_auth=True)
+def web():
+    """The HTTP API (h3_api.py) the Syok router calls with the user's Modal proxy token. The router adds X-Syok-Country
+    (from Cloudflare's request.cf.country) and strips any client-sent copy; the API fails closed without it."""
+    eng = _eng()
+    import h3_api
+
+    def reload():
+        for vol in (jobs, models):
+            try:
+                vol.reload()
+            except Exception:  # a volume with files open by a concurrent request cannot reload; the next request will
+                pass
+
+    def weights_state():
+        return eng.weights_state(MODELS)
+
+    return h3_api.build_h3_app(JOBS, check_job.spawn, swap_job.spawn, lambda: fetch_models.spawn({}), weights_state,
+                               before_read=reload, after_write=jobs.commit)
 
 
 # ---------------------------------------------------------------- local entry points
