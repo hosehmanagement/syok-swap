@@ -44,6 +44,10 @@ image = (
     .add_local_file(Path(__file__).parent / "sam2_cc_fallback.py", "/opt/sam2_cc_fallback.py", copy=True)
     .add_local_file(Path(__file__).parent / "patch_sam2.py", "/opt/patch_sam2.py", copy=True)
     .run_commands("python /opt/patch_sam2.py")
+    # Wan's mask grid (--w_len/--h_len): a person narrower than 10 px or shorter than 20 px in some frame would make a grid cell
+    # 0 px and crash preprocess; patch the cell size to at least 1 px (fails this cheap CPU build if Wan's file ever changes)
+    .add_local_file(Path(__file__).parent / "patch_wan_mask.py", "/opt/patch_wan_mask.py", copy=True)
+    .run_commands("python /opt/patch_wan_mask.py /opt/wan/wan/modules/animate/preprocess/utils.py")
     .pip_install("huggingface_hub[hf_transfer]")
     # imported by Wan's package but missing from its requirements files (found when a paid H100 run failed on einops)
     .pip_install("einops", "regex", "safetensors", "librosa", "scipy")
@@ -101,33 +105,40 @@ def _sk():
     return swapkit
 
 
-def _preview_core(sk, d, raw, ref, resolution, margin, start, length):
-    """Find the person and write mask.mp4 + preview.mp4 (red overlay) into job folder `d`. Returns the numbers the UI shows."""
+def _preview_core(sk, d, raw, ref, resolution, margin, start, length, mask_shape=None):
+    """Find the person and write mask.mp4 + preview.mp4 (red overlay) into job folder `d`. Returns the numbers the UI shows.
+    mask_shape "silhouette" (default): Wan's mask grid follows the person and the head is added as an ellipse; "box": the old
+    whole-bounding-box mask plus head rectangle (swapkit.MASK_SHAPES)."""
+    mask_shape = mask_shape or sk.DEFAULT_MASK_SHAPE
     info = sk.probe(raw)
     s, l = sk.plan_section(info["duration"], start, length)
     sec = d / "section.mp4"
     sk.cut_section(raw, sec, s, l)
-    it, k = sk.MARGINS[margin]
+    mask_args = sk.preprocess_mask_args(margin, mask_shape)
     w, h = sk.RESOLUTIONS[resolution]
     pre = "/opt/wan/wan/modules/animate/preprocess"
     (d / "proc").mkdir(parents=True, exist_ok=True)
     r = subprocess.run(
         ["python", "preprocess_data.py", "--ckpt_path", f"{WEIGHTS}/process_checkpoint", "--video_path", str(sec),
          "--refer_path", str(ref), "--save_path", str(d / "proc"), "--resolution_area", str(w), str(h),
-         "--replace_flag", "--iterations", str(it), "--k", str(k)],
+         "--replace_flag", *mask_args],
         cwd=pre, capture_output=True, text=True)
     if r.returncode:
         raise RuntimeError("preprocess failed:\n" + (r.stdout + r.stderr)[-2500:])
-    # Wan's mask can leave the head out (SAM2 body points + a bounding box), which keeps the ORIGINAL head in the background
-    head = sk.cover_head_files(d / "proc", sec)
+    # Wan's mask can leave the head out (SAM2 body points), which keeps the ORIGINAL head in the background
+    head = sk.cover_head_files(d / "proc", sec, shape=mask_shape)
     mask, inverted = sk.normalize_mask(d / "proc" / "src_mask.mp4", d / "mask.mp4")
     stats = sk.mask_stats(mask)
+    stats["mask_shape"] = mask_shape
+    stats["box_mean"] = head["coverage"]["box_mean"]     # what the old box mask would have covered on this clip
     sk.mask_preview(sec, mask, d / "preview.mp4")
-    return {"section": [s, l], "resolution": resolution, "margin": margin, "mask_inverted": inverted, "stats": stats, "head": head}
+    return {"section": [s, l], "resolution": resolution, "margin": margin, "mask_shape": mask_shape,
+            "mask_inverted": inverted, "stats": stats, "head": head}
 
 
 @app.function(image=image, gpu=["L4", "A10G", "L40S"], volumes={"/cache": cache}, timeout=1800)
-def make_preview(video: bytes, photo: bytes, photo_ext: str, resolution: str, margin: str, start: float, length: float):
+def make_preview(video: bytes, photo: bytes, photo_ext: str, resolution: str, margin: str, start: float, length: float,
+                 mask_shape: str = "silhouette"):
     sk = _sk()
     cache.reload()
     job = uuid.uuid4().hex[:10]
@@ -137,7 +148,7 @@ def make_preview(video: bytes, photo: bytes, photo_ext: str, resolution: str, ma
     raw.write_bytes(video)
     ref = d / f"person{photo_ext}"
     ref.write_bytes(photo)
-    meta = {"job": job, **_preview_core(sk, d, raw, ref, resolution, margin, start, length)}
+    meta = {"job": job, **_preview_core(sk, d, raw, ref, resolution, margin, start, length, mask_shape)}
     (d / "meta.json").write_text(json.dumps(meta, indent=1))
     cache.commit()
     return meta, (d / "preview.mp4").read_bytes()
@@ -230,7 +241,8 @@ def mask_job(job: str):
     ts.set_stage(d, "mask", state="preparing")
     cache.commit()
     try:
-        m = _preview_core(sk, d, d / "raw.mp4", d / q["ref"], q["resolution"], q["margin"], q["start"], q["length"])
+        m = _preview_core(sk, d, d / "raw.mp4", d / q["ref"], q["resolution"], q["margin"], q["start"], q["length"],
+                          q.get("mask_shape"))
         ss.mask_ready(JOBS, job, m["section"], m["stats"], m["head"])
     except Exception as e:
         ss.fail(JOBS, job, "mask", _friendly(e, "The mask step failed. Nothing was swapped and no swap was charged. Try a clearer clip."))
@@ -389,13 +401,14 @@ def fetch():
 
 @app.local_entrypoint()
 def preview(video: str, image: str, consent: str = "", resolution: str = "480p", margin: str = "normal",
-            start: float = 0.0, length: float = 0.0, out: str = "preview.mp4"):
+            start: float = 0.0, length: float = 0.0, out: str = "preview.mp4", mask_shape: str = "silhouette"):
     if consent != "yes":
         raise SystemExit("Only use photos and videos of people who agreed to it (or fictional characters). Re-run with --consent yes.")
     ext = Path(image).suffix.lower()
     if ext not in (".png", ".jpg", ".jpeg", ".webp"):
         raise SystemExit("Character photo must be png, jpg or webp.")
-    meta, pv = make_preview.remote(Path(video).read_bytes(), Path(image).read_bytes(), ext, resolution, margin, start, length)
+    meta, pv = make_preview.remote(Path(video).read_bytes(), Path(image).read_bytes(), ext, resolution, margin, start, length,
+                                   mask_shape)
     Path(out).write_bytes(pv)
     print(json.dumps(meta, indent=1))
     print(f"Mask preview saved to {out}. Check it, then: modal run app.py::render --job {meta['job']}")

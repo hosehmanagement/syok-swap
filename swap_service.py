@@ -81,18 +81,23 @@ def _num(v, name):
 
 def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", margin="normal", start=0.0, length=0.0,
                  skin=None, skin_ext="", detector=tt.detect_face, face=None, face_ext="", facelock=False, faces=None,
-                 face_detector=None, collage=False):
+                 face_detector=None, collage=False, mask_shape=""):
     """Store the original clip and the new person's photo. Returns the job id; the mask step then runs on a small GPU.
     `faces` is a list of (bytes, ext) candidate photos for face-lock (`face`/`face_ext` is the one-photo form); the best of
     them and the main photo is kept (picker.py). `facelock` asks for the face-lock pass after the swap.
     `collage` (EXPERIMENTAL, needs at least one face photo): Wan gets ref_collage.png (main photo + close-up, collage.py) as
-    its reference instead of the main photo; the slider, the face check and face-lock still use the main photo."""
+    its reference instead of the main photo; the slider, the face check and face-lock still use the main photo.
+    `mask_shape`: "silhouette" (default: the red mask follows the person) or "box" (the old whole-bounding-box mask);
+    swapkit.MASK_SHAPES. Stored in the request only when it is "box", so a default job's request is exactly as before."""
     resolution = resolution or "480p"
     margin = margin or "normal"
     if resolution not in sk.RESOLUTIONS:
         raise JobError("Resolution must be 480p or 720p.")
     if margin not in sk.MARGINS:
         raise JobError("Margin must be tight, normal or loose.")
+    mask_shape = (mask_shape or sk.DEFAULT_MASK_SHAPE).strip().lower()
+    if mask_shape not in sk.MASK_SHAPES:
+        raise JobError("Mask shape must be silhouette or box.")
     start, length = _num(start, "Start"), _num(length, "Length")
     uploads = face_uploads(faces, face, face_ext)
     if collage and not uploads:
@@ -111,6 +116,8 @@ def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", marg
             request["facelock"] = True
         if collage:                                   # same rule: only present when on
             request["collage"] = True
+        if mask_shape != sk.DEFAULT_MASK_SHAPE:       # same rule: only present when not the default
+            request["mask_shape"] = mask_shape
         meta.update(kind="swap", request=request,
                     mask={"state": "queued"}, swap={"state": "idle"}, prepare={"state": "idle"},
                     facelock={"state": "idle"}, estimate=estimate(resolution, l))
