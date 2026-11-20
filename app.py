@@ -9,8 +9,9 @@ Two steps so you never pay for a bad mask:
     modal run app.py::preview --video v.mp4 --image face.png --consent yes
     modal run app.py::render  --job <id>
 
-The same two steps (plus Syok's texture slider on the result) are also served as ONE web app for the Syok "Recast -> Syok Swap"
-card, in the user's own Modal account:   modal deploy app.py     (see docs/SWAP.md).
+The same two steps (plus Syok's texture slider on the result, and the optional face-lock pass that uses the user's own Magic
+Hour account) are also served as ONE web app for the Syok "Recast -> Syok Swap" card, in the user's own Modal account:
+    modal deploy app.py     (see docs/SWAP.md).
 """
 import json
 import os
@@ -71,6 +72,7 @@ light = (
     .add_local_file(HERE / "texture_service.py", "/opt/texture_service.py")
     .add_local_file(HERE / "swap_service.py", "/opt/swap_service.py")
     .add_local_file(HERE / "swap_api.py", "/opt/swap_api.py")
+    .add_local_file(HERE / "facelock.py", "/opt/facelock.py")
 )
 WEIGHTS_FLAGS = "/cache"      # .weights-downloading / .weights-ok live next to the model folder
 
@@ -246,13 +248,15 @@ def swap_job(job: str):
     cache.commit()
     try:
         had_audio = _render_core(sk, d, relight, 7, False, "", 1.0)
-        ss.finish_swap(JOBS, job, d / "final.mp4", had_audio)
+        prepare = ss.finish_swap(JOBS, job, d / "final.mp4", had_audio)
         (d / "final.mp4").unlink(missing_ok=True)        # final.mp4 is the TEXTURED result from here on; the swapped clip is src.mp4
         cache.commit()
     except Exception as e:
         ss.fail(JOBS, job, "swap", _friendly(e, "The swap failed. Try again; the mask is kept, so nothing needs to be uploaded again."))
         cache.commit()
         raise
+    if not prepare:                                      # face-lock asked for: it waits for the user's Magic Hour key first
+        return
     try:
         prepare_job.spawn(job)                           # CPU, cents: the slider can be used as soon as this is done
     except Exception:
@@ -266,6 +270,27 @@ def prepare_job(job: str):
     cache.reload()
     _svc()[1].run_prepare(JOBS, job)
     cache.commit()
+
+
+@app.function(image=light, volumes={"/cache": cache}, cpu=2, timeout=1800)
+def facelock_job(job: str, key: str):
+    """Optional face-lock (CPU, the user's own Magic Hour credits): the exact face from the photo onto the swapped clip, then
+    the slider is prepared again. The key is only an argument here: never logged, never written to the volume."""
+    cache.reload()
+    if "/opt" not in sys.path:
+        sys.path.insert(0, "/opt")
+    import facelock
+    ss, ts = _svc()
+    prepare = facelock.run(JOBS, job, key, on_progress=cache.commit)
+    cache.commit()
+    if not prepare:
+        return
+    try:
+        prepare_job.spawn(job)
+    except Exception:
+        ss.fail(JOBS, job, "prepare", "Preparing the texture slider could not start. Try again.")
+        cache.commit()
+        raise RuntimeError("prepare_job could not be spawned") from None
 
 
 @app.function(image=light, volumes={"/cache": cache}, cpu=2, timeout=3600)
@@ -304,7 +329,7 @@ def web():
 
     return swap_api.build_app(JOBS, mask_job.spawn, swap_job.spawn, texture_render_job.spawn, fetch_weights.spawn,
                               weights_state, before_read=reload, after_write=cache.commit,
-                              spawn_prepare=prepare_job.spawn)
+                              spawn_prepare=prepare_job.spawn, spawn_facelock=facelock_job.spawn)
 
 
 @app.function(image=image, volumes={"/cache": cache}, cpu=4, timeout=900)
