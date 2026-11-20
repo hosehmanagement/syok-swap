@@ -76,7 +76,7 @@ class Rig:
 def test_whole_flow_through_the_http_layer(tmp_path):
     r = Rig(tmp_path)
     h = r.c.get("/health").json()
-    assert h["ok"] and h["app"] == "syok-swap" and h["version"] == 3 and h["weights"] == "ready" and h["facelock"] is True
+    assert h["ok"] and h["app"] == "syok-swap" and h["version"] == 4 and h["weights"] == "ready" and h["facelock"] is True
     assert h["strength"] == {"min": 0.0, "max": 3.0, "start": 2.0} and h["limits"]["keep_days"] == 3
     up = r.upload(resolution="480p", margin="normal")
     assert up.status_code == 200

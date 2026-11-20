@@ -74,7 +74,7 @@ def build_app(root, spawn_mask, spawn_swap, spawn_render, spawn_weights, weights
     @app.get("/health")
     def health():
         before_read()
-        return {"ok": True, "app": "syok-swap", "version": 3, "weights": weights_state(), "facelock": True, "collage": True,
+        return {"ok": True, "app": "syok-swap", "version": 4, "weights": weights_state(), "facelock": True, "collage": True, "composite": "two-mask",
                 "mask_shapes": sorted(svc.sk.MASK_SHAPES), "mask_shape": svc.sk.DEFAULT_MASK_SHAPE,
                 "strength": {"min": tt.MIN_STRENGTH, "max": tt.MAX_STRENGTH, "start": tt.DEFAULT_STRENGTH},
                 "limits": {"video_mb": svc.MAX_VIDEO_BYTES // 2**20, "photo_mb": svc.MAX_PHOTO_BYTES // 2**20,

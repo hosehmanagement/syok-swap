@@ -20,8 +20,10 @@ MARGINS = {"tight": (2, 5), "normal": (3, 7), "loose": (4, 9)}
 # preprocess_data.py. Wan fills every grid cell of the person's bounding box that touches the (dilated) SAM2 mask. Wan's CLI
 # default is 1 x 1: ONE cell, so the WHOLE bounding box is filled (the wide red rectangle over the hedge, found 20 Nov 2026).
 # "silhouette" uses get_aug_mask's own default grid (10 x 20 cells), so the mask follows the person's outline in cells of
-# 1/10 of the person's width and 1/20 of their height. "box" is the old behaviour, kept reachable.
-MASK_SHAPES = {"silhouette": (10, 20), "box": (1, 1)}
+# 1/10 of the person's width and 1/20 of their height. "blocky" is a coarser grid (1/6 by 1/12): more room for the new body
+# to differ from the old one (Wan's guide and two papers: a very exact mask makes the new person copy the old outline), safe
+# because composite_two_mask() puts the original background back. "box" is the old behaviour, kept reachable.
+MASK_SHAPES = {"silhouette": (10, 20), "blocky": (6, 12), "box": (1, 1)}
 DEFAULT_MASK_SHAPE = "silhouette"
 
 
@@ -30,7 +32,7 @@ def preprocess_mask_args(margin, mask_shape=DEFAULT_MASK_SHAPE):
     if margin not in MARGINS:
         raise ValueError("Margin must be tight, normal or loose.")
     if mask_shape not in MASK_SHAPES:
-        raise ValueError("Mask shape must be silhouette or box.")
+        raise ValueError("Mask shape must be silhouette, blocky or box.")
     it, k = MARGINS[margin]
     wl, hl = MASK_SHAPES[mask_shape]
     return ["--iterations", str(it), "--k", str(k), "--w_len", str(wl), "--h_len", str(hl)]
@@ -165,6 +167,101 @@ def composite_over_original(original, generated, mask, out, feather=7, full_res=
                 m = cv2.GaussianBlur(m, (k, k), 0)
             m = m[..., None]
             w.put(o.astype(np.float32) * (1 - m) + g.astype(np.float32) * m)
+    finally:
+        w.close()
+    return n
+
+
+def _odd(n):
+    n = max(1, int(n))
+    return n | 1
+
+
+def colour_gain_bias(orig, gen, bg_region, prev=None, smooth=0.4):
+    """Per-channel gain and bias that make `gen` match `orig` on the pixels that should be identical (bg_region). Wan sends the
+    whole frame through its VAE, which shifts exposure and colour a little and by a different amount in each 77-frame chunk.
+    Returns (gain[3], bias[3]); (1, 0) when there is too little background to measure. Smoothed against `prev` so it cannot
+    flicker from frame to frame."""
+    if bg_region.mean() < 0.02:
+        return (prev if prev is not None else (np.ones(3, np.float32), np.zeros(3, np.float32)))
+    sel = bg_region[::3, ::3]
+    o = orig[::3, ::3][sel].astype(np.float32)
+    g = gen[::3, ::3][sel].astype(np.float32)
+    if len(o) < 200:
+        return (prev if prev is not None else (np.ones(3, np.float32), np.zeros(3, np.float32)))
+    mo, mg = o.mean(axis=0), g.mean(axis=0)
+    so, sg = o.std(axis=0) + 1e-3, g.std(axis=0) + 1e-3
+    gain = np.clip(so / sg, 0.85, 1.2).astype(np.float32)
+    bias = (mo - gain * mg).astype(np.float32)
+    if prev is not None:
+        gain = smooth * gain + (1 - smooth) * prev[0]
+        bias = smooth * bias + (1 - smooth) * prev[1]
+    return gain, bias
+
+
+def two_mask_matte(o, g, gen_mask, core, feather=7, grow=None, thr=22.0):
+    """Where to take the GENERATED pixel (1) and where to keep the ORIGINAL one (0), for one frame.
+    gen_mask: what Wan was told to redraw (the loose grid mask). core: the old person's own outline plus the head (tight).
+    Inside the core: generated. Outside gen_mask: original (the background, untouched). In the ring between the two (grid cells
+    that hold background, or a new body wider than the old one): generated only where it differs from the original in COLOUR AT
+    LOW DETAIL (a body against a hedge), so a hedge Wan merely redrew keeps its original leaves. All masks are boolean HxW."""
+    h, w = gen_mask.shape
+    grow = grow if grow is not None else max(3, int(round(0.012 * max(h, w))))
+    core_d = cv2.dilate(core.astype(np.uint8), np.ones((_odd(grow * 2 + 1),) * 2, np.uint8)).astype(bool) if core.any() else core
+    ring = gen_mask & ~core_d
+    sh_, sw_ = max(1, h // 4), max(1, w // 4)
+    ob = cv2.GaussianBlur(cv2.resize(o, (sw_, sh_), interpolation=cv2.INTER_AREA), (_odd(max(5, sw_ // 12)),) * 2, 0)
+    gb = cv2.GaussianBlur(cv2.resize(g, (sw_, sh_), interpolation=cv2.INTER_AREA), (_odd(max(5, sw_ // 12)),) * 2, 0)
+    diff = np.abs(ob.astype(np.float32) - gb.astype(np.float32)).max(axis=2)
+    diff = cv2.resize(diff, (w, h), interpolation=cv2.INTER_LINEAR)
+    keep_gen = ring & (diff > thr)
+    keep_gen = cv2.morphologyEx(keep_gen.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    keep_gen = cv2.dilate(keep_gen, np.ones((_odd(max(5, grow)),) * 2, np.uint8)).astype(bool) & gen_mask
+    matte = (core_d | keep_gen) & cv2.dilate(gen_mask.astype(np.uint8), np.ones((_odd(feather * 2 + 1),) * 2, np.uint8)).astype(bool)
+    a = matte.astype(np.float32)
+    if feather:
+        a = cv2.GaussianBlur(a, (_odd(feather * 2 + 1),) * 2, 0)
+    return a
+
+
+def composite_two_mask(original, generated, mask, core, out, feather=7, full_res=False, color_match=True):
+    """Two masks, as the research on person replacement advises: Wan REDRAWS inside `mask` (loose, so the new body may differ
+    from the old one) but the final clip takes the ORIGINAL pixels everywhere the new person is not (the background is exactly
+    the camera's, not Wan's re-encoded copy), using a tight matte built from `core` (see two_mask_matte). The generated frame
+    is first colour-matched to the original on the pixels outside the mask. Frames are matched by time. Returns frames written."""
+    info = probe(original)
+    ow, oh, ofps = info["width"], info["height"], info["fps"]
+    orig = list(frames(original))
+    gen = list(frames(generated))
+    msk = list(frames(mask))
+    cor = list(frames(core))
+    if not (orig and gen and msk and cor):
+        raise ValueError("Empty video passed to composite.")
+    ginfo = probe(generated)
+    gfps = ginfo["fps"]
+    if full_res:
+        ow, oh = ginfo["width"], ginfo["height"]
+    n = int(round(len(gen) / gfps * ofps))
+    w = Writer(out, ow, oh, ofps)
+    prev = None
+    ring_px = max(8, int(0.03 * min(ow, oh)))
+    try:
+        for i in range(n):
+            o = orig[min(len(orig) - 1, i)]
+            if o.shape[1] != ow or o.shape[0] != oh:
+                o = cv2.resize(o, (ow, oh), interpolation=cv2.INTER_CUBIC)
+            gi = min(len(gen) - 1, int(round(i / ofps * gfps - 1e-9)))
+            g = cv2.resize(gen[gi], (ow, oh), interpolation=cv2.INTER_CUBIC)
+            mi = min(len(msk) - 1, gi)
+            m = cv2.resize(msk[mi], (ow, oh), interpolation=cv2.INTER_LINEAR).max(axis=2) > 127
+            c = cv2.resize(cor[min(len(cor) - 1, mi)], (ow, oh), interpolation=cv2.INTER_LINEAR).max(axis=2) > 127
+            if color_match:
+                far = ~cv2.dilate(m.astype(np.uint8), np.ones((_odd(ring_px * 2 + 1),) * 2, np.uint8)).astype(bool)
+                gain, bias = colour_gain_bias(o, g, far, prev)
+                prev = (gain, bias)
+                g = np.clip(g.astype(np.float32) * gain + bias, 0, 255).astype(np.uint8)
+            a = two_mask_matte(o, g, m, c, feather=feather)[..., None]
+            w.put(o.astype(np.float32) * (1 - a) + g.astype(np.float32) * a)
     finally:
         w.close()
     return n
@@ -330,7 +427,7 @@ def cover_head_files(proc_dir, section, face_fn=None, shape="box"):
     share of the frame in Wan's mask before the head was added (wan_mean), after (final_mean), and what the old box path
     would have covered on this same mask (box_mean: Wan's mask filled to its bounding box plus the old head rectangle)."""
     if shape not in MASK_SHAPES:
-        raise ValueError("Mask shape must be silhouette or box.")
+        raise ValueError("Mask shape must be silhouette, blocky or box.")
     proc = Path(proc_dir)
     face_fn = face_fn or detect_face_box
     bg_p, mk_p = proc / "src_bg.mp4", proc / "src_mask.mp4"
@@ -369,13 +466,24 @@ def cover_head_files(proc_dir, section, face_fn=None, shape="box"):
     else:
         heads = head_ellipses(gray, faces)
         adds = [head_region((hh, ww), x) for x in heads]
+    raw_p = proc / "src_mask_raw.mp4"           # SAM2's own person mask, written by patch_wan_raw_mask.py (absent on old jobs)
+    raw = list(frames(raw_p)) if raw_p.exists() else []
+    if raw and len(raw) != len(mk):
+        raw = []
     shutil.copy(bg_p, proc / "src_bg_nohead.mp4")
     shutil.copy(mk_p, proc / "src_mask_nohead.mp4")
     wb = Writer(bg_p, info["width"], info["height"], info["fps"])
     wm = Writer(mk_p, info["width"], info["height"], info["fps"])
+    wc = Writer(proc / "src_core.mp4", info["width"], info["height"], info["fps"]) if raw else None
     wan_cover, final_cover, ext = [], [], []
     try:
-        for f, g, a in zip(bg, gray, adds):
+        for j, (f, g, a) in enumerate(zip(bg, gray, adds)):
+            if wc is not None:                     # the person's own outline (SAM2) plus the head: no grid, no dilation
+                rg = raw[j].max(axis=2)
+                if rg.shape != g.shape:
+                    rg = cv2.resize(rg, (g.shape[1], g.shape[0]), interpolation=cv2.INTER_NEAREST)
+                core = ((rg > 127) | a).astype(np.uint8) * 255
+                wc.put(np.repeat(core[..., None], 3, axis=2))
             on = g > 127
             wan_cover.append(float(on.mean()))
             new = a & ~on
@@ -393,7 +501,9 @@ def cover_head_files(proc_dir, section, face_fn=None, shape="box"):
     finally:
         wb.close()
         wm.close()
-    return {"frames": len(bg), "faces_detected": sum(1 for f in faces if f is not None),
+        if wc is not None:
+            wc.close()
+    return {"frames": len(bg), "has_core": bool(raw), "faces_detected": sum(1 for f in faces if f is not None),
             "frames_extended": len(ext), "mean_extension_px": float(np.mean(ext)) if ext else 0.0,
             "head_shape": "rectangle" if shape == "box" else "ellipse", "mask_shape": shape,
             "coverage": {"wan_mean": float(np.mean(wan_cover)), "final_mean": float(np.mean(final_cover)),
