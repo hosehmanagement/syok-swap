@@ -1,6 +1,6 @@
 name: deploy Syok Swap H3 engine to my Modal
 # Run this in YOUR OWN copy (fork) of this repo. It puts the H3 engine (h3_app.py) in YOUR Modal account, so Modal bills you.
-# Needs two repository secrets: MODAL_TOKEN_ID and MODAL_TOKEN_SECRET (same as deploy-swap.yml).
+# Needs two repository secrets: MODAL_TOKEN_ID and MODAL_TOKEN_SECRET.
 # MiniMax H3 is licensed only OUTSIDE the US, EU, UK and South Korea (see docs/H3_TERRITORY.md and docs/H3.md): you are the licensee.
 on:
   workflow_dispatch:

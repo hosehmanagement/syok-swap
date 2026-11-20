@@ -1,8 +1,7 @@
 """Syok Swap H3: openjutsu's 'Simple' swap and 'Check mask' run headlessly in ComfyUI on the user's own Modal account.
 
-A SEPARATE Modal app ("syok-swap-h3") with its own two Volumes; the Wan engine (app.py, "syok-swap") is not touched.
-NOTHING HERE HAS BEEN RUN ON MODAL YET. See docs/H3.md for every unverified item before the first deploy.
-The web endpoint (web(), h3_api.py) is the one the Syok router calls; it has not been deployed yet either.
+Modal app "syok-swap-h3" with its own two Volumes. Deployed and live-tested (21 Nov 2026, 6 s at 480p); see docs/H3.md
+for what is measured and what is not. The web endpoint (web(), h3_api.py) is the one the Syok router calls.
 
     modal run h3_app.py::fetch                                 # once: model files into the syok-h3-models Volume (see docs)
     modal run h3_app.py::new --video v.mp4 --photo p.png --consent yes [--margin normal --start 0 --length 6 --seed 0 --resolution 480p]
@@ -307,7 +306,7 @@ def read_result(job: str, stage: str):
 
 @app.function(image=light, volumes={JOBS: jobs}, schedule=modal.Period(hours=6), timeout=600)
 def sweep_old_jobs():
-    """Job folders (uploads, ComfyUI outputs and checkpoints, results) are deleted after 3 days, as in the Wan engine."""
+    """Job folders (uploads, ComfyUI outputs and checkpoints, results) are deleted after 3 days."""
     eng = _eng()
     jobs.reload()
     n = eng.tsvc.sweep(JOBS)

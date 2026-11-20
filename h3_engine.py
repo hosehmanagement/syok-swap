@@ -1,7 +1,7 @@
 """Syok Swap H3 engine: Openjutsu's 'Simple' swap and 'Check mask' workflows run headlessly in ComfyUI (pure Python here).
 
 No Modal, no GPU, no network in this file, so every rule is unit-testable. h3_app.py is the Modal side (image, Volumes,
-the ComfyUI process). The Wan engine (app.py, swap_service.py) is untouched; this is a separate, additional engine.
+the ComfyUI process).
 
 Workflows (copied from D3voz/openjutsu, MIT, see workflows/openjutsu/LICENSE and THIRD-PARTY.md):
     workflows/openjutsu/simple.api.json   the swap: SAM 3.1 tracks the main person, MiniMax H3 redraws them, clip by clip,
@@ -12,8 +12,8 @@ The patching below is a Python port of openjutsu lib/simple.ts (pruneSimple, pru
 cropSource, dropNoLipSync, setMotionSize, suffixRunName) and lib/clips.ts (clip plan estimate), same node ids, same rules.
 lib/model.ts is NOT ported: with the default model files it changes nothing in the export (the export already names them).
 
-A job is a folder under a root directory (on Modal: the `syok-h3-jobs` Volume), the same pattern as swap_service.py and the
-same helpers (texture_service.new_job / read_meta / write_meta / set_stage). meta.json carries two H3 stages:
+A job is a folder under a root directory (on Modal: the `syok-h3-jobs` Volume), with the job folder
+helpers (texture_service.new_job / read_meta / write_meta / set_stage). meta.json carries two H3 stages:
 
     check   "idle" -> "queued" -> "running" -> "ready" | "error"         small GPU: SAM only, writes check.mp4
     swap    "idle" -> "queued" -> "generating" -> "done" | "error"      big GPU, the paid step: writes h3.mp4
@@ -53,9 +53,9 @@ MIN_SECTION_SECONDS = 2.0
 FPS = 24                                                 # every export loads the video at force_rate 24
 DEFAULT_TARGET = "person"
 
-# Our own limits (not from openjutsu): same 30 s per job as the Wan engine, to keep one run's cost bounded.
+# Our own limits (not from openjutsu): 30 s per job, to keep one run's cost bounded.
 MAX_SECTION_SECONDS = 30.0
-DEFAULT_RESOLUTION = "480p"   # openjutsu's page defaults to 736p; 480p is the cheapest preset and the Wan engine's default
+DEFAULT_RESOLUTION = "480p"   # openjutsu's page defaults to 736p; 480p is the cheapest preset
 
 # Node ids in workflows/openjutsu/simple.api.json (openjutsu NODES).
 NODES = {"picture": "2", "video": "5", "plan": "11", "target": "24", "loopStart": "28", "peopleMask": "39",
@@ -374,7 +374,7 @@ def plan_section(duration, start, length):
     return round(start, 3), round(length, 3)
 
 
-# ---------------------------------------------------------------- job folder (meta.json, same pattern as swap_service)
+# ---------------------------------------------------------------- job folder (meta.json, texture_service helpers)
 
 KIND = "h3"
 VIDEO_NAME = "raw.mp4"
