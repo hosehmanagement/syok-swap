@@ -42,7 +42,7 @@ LICENCE_NOTICE = (
 )
 BLOCKED_MESSAGE = (
     "MiniMax H3 is not available in your region. Its licence does not allow use in the US, the EU, the UK or "
-    "South Korea, and we could not confirm you are outside them. You can still use the standard engine."
+    "South Korea, and we could not confirm you are outside them."
 )
 
 
