@@ -154,3 +154,8 @@ and redraws textures (a hedge gets other leaves) in every 77-frame chunk. The re
 **NOT measured:** tested only on synthetic frames. Unknown on real footage: how the colour-difference test behaves with similar
 colours (a green dress against a hedge), and with fast motion. `recomposite_job` rebuilds a finished render on the CPU for free,
 so the same generated.mp4 can be re-composited with other settings.
+
+
+## Fit step (Qwen-Image-Edit on your own Modal, no key)
+
+With `fit=yes` on POST /swap, `generate_job` first runs `fit_job` (H100/A100-80GB, its own image): Qwen-Image-Edit-2511 (Apache-2.0, 4-step Lightning LoRA) paints the person from your photo into a crop of the clip's FIRST and LAST frame. Edits that redraw the scene or change nothing are dropped (fitref.py guards). The passed crops go side by side into `fit_ref.png`, which replaces `proc/src_ref.png` before Wan generates. If nothing passes or the step fails, Wan gets your own photo as before. Estimate: about 0.25 USD and 3 minutes extra (not measured yet). Test alone: `modal run app.py::fit --job <id>`. The skin grain slider defaults to strength 2.0.

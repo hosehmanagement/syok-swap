@@ -85,6 +85,26 @@ light = (
     .add_local_file(HERE / "collage.py", "/opt/collage.py")            # EXPERIMENTAL collage reference, made at upload
     .add_local_file(HERE / "lora" / "face_detection_yunet_2023mar.onnx", "/opt/face_detection_yunet_2023mar.onnx")  # its detector
 )
+# Qwen-Image-Edit-2511 (Apache-2.0) for the fit step. Its OWN image: Wan's image pins other torch/diffusers versions.
+# Pins verified by the research helper: diffusers >= 0.37 is needed for the 2511 transformer (zero_cond_t), and transformers 5.x silently
+# gives wrong edits (diffusers issue #14194), so transformers stays on 4.57 with huggingface_hub < 1.0.
+QWEN_REPO = "Qwen/Qwen-Image-Edit-2511"
+QWEN_LORA_REPO = "lightx2v/Qwen-Image-Edit-2511-Lightning"
+QWEN_LORA_FILE = "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"
+QWEN_DIR = "/cache/Qwen-Image-Edit-2511"
+QWEN_LORA_DIR = "/cache/Qwen-Image-Edit-2511-Lightning"
+qwen_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("libgl1", "libglib2.0-0")
+    .pip_install("torch==2.8.0", "torchvision==0.23.0", "diffusers==0.37.1", "transformers==4.57.6", "accelerate==1.16.0",
+                 "peft==0.18.1", "huggingface_hub[hf_xet]<1.0", "safetensors", "sentencepiece", "pillow<13",
+                 "numpy<2", "opencv-python-headless<5")
+    .run_commands("python -c 'import torch, diffusers, transformers; from diffusers import QwenImageEditPlusPipeline; print(diffusers.__version__, transformers.__version__)'")
+    .add_local_file(HERE / "fitref.py", "/opt/fitref.py")
+    .add_local_file(HERE / "swap_service.py", "/opt/swap_service.py")
+    .add_local_file(HERE / "texture_service.py", "/opt/texture_service.py")
+    .add_local_file(HERE / "picker.py", "/opt/picker.py")
+)
 WEIGHTS_FLAGS = "/cache"      # .weights-downloading / .weights-ok live next to the model folder
 
 
@@ -179,6 +199,8 @@ def _render_core(sk, d, relight, feather, full_res, lora, lora_strength):
     for name in ("section.mp4", "mask.mp4", "core.mp4"):
         if (d / name).exists():                        # core.mp4 is missing on jobs masked before the two-mask composite
             shutil.copy(d / name, w / name)
+    if (d / "fit_ref.png").exists():                   # the new person fitted to the first and last frame (fit_job): Wan's reference
+        shutil.copy(d / "fit_ref.png", w / "proc" / "src_ref.png")
     import cv2
     # Inside generate.py, cv2.imread of a PNG dies with "libpng error: bad parameters to zlib" (a zlib clash with another
     # library loaded in that process). cv2.imread picks the decoder from the file CONTENT, so store the reference as BMP
@@ -245,6 +267,78 @@ def _friendly(e, fallback):
     return str(e) if isinstance(e, ValueError) else fallback
 
 
+def _qwen_editor():
+    """Load Qwen-Image-Edit-2511 + the 4-step Lightning LoRA once (weights are downloaded into the cache volume on first use)
+    and return edit(scene_bgr, person_bgr, prompt) -> edited scene (bgr, same size as the scene)."""
+    import math
+    import cv2
+    import numpy as np
+    import torch
+    from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPlusPipeline
+    from huggingface_hub import snapshot_download
+    from PIL import Image
+    base = snapshot_download(QWEN_REPO, local_dir=QWEN_DIR, allow_patterns=[
+        "model_index.json", "processor/*", "scheduler/*", "text_encoder/*", "tokenizer/*", "transformer/*", "vae/*"])
+    lora = snapshot_download(QWEN_LORA_REPO, local_dir=QWEN_LORA_DIR, allow_patterns=[QWEN_LORA_FILE])
+    cache.commit()
+    scheduler = FlowMatchEulerDiscreteScheduler.from_config({
+        "base_image_seq_len": 256, "base_shift": math.log(3), "invert_sigmas": False, "max_image_seq_len": 8192,
+        "max_shift": math.log(3), "num_train_timesteps": 1000, "shift": 1.0, "shift_terminal": None, "stochastic_sampling": False,
+        "time_shift_type": "exponential", "use_beta_sigmas": False, "use_dynamic_shifting": True,
+        "use_exponential_sigmas": False, "use_karras_sigmas": False})
+    pipe = QwenImageEditPlusPipeline.from_pretrained(base, scheduler=scheduler, torch_dtype=torch.bfloat16)
+    pipe.load_lora_weights(lora, weight_name=QWEN_LORA_FILE, adapter_name="lightning")
+    pipe.set_adapters(["lightning"], adapter_weights=[1.0])
+    pipe.to("cuda")
+
+    def edit(scene_bgr, person_bgr, prompt):
+        h0, w0 = scene_bgr.shape[:2]
+        img1 = Image.fromarray(cv2.cvtColor(scene_bgr, cv2.COLOR_BGR2RGB))
+        img2 = Image.fromarray(cv2.cvtColor(person_bgr, cv2.COLOR_BGR2RGB))
+        # the pipeline would follow the LAST image's shape (the photo); force the scene's, about 1 MP, multiples of 32
+        w = math.sqrt(1024 * 1024 * w0 / h0)
+        W, H = max(32, round(w / 32) * 32), max(32, round((w / (w0 / h0)) / 32) * 32)
+        out = pipe(image=[img1, img2], prompt=prompt, negative_prompt=" ", true_cfg_scale=1.0, num_inference_steps=4,
+                   width=W, height=H, generator=torch.Generator("cuda").manual_seed(42)).images[0]
+        out = out.resize((w0, h0), Image.LANCZOS)
+        return cv2.cvtColor(np.array(out), cv2.COLOR_RGB2BGR)
+    return edit
+
+
+@app.function(image=qwen_image, gpu=["H100", "A100-80GB"], volumes={"/cache": cache}, timeout=3600, max_containers=1)
+def fit_job(job: str):
+    """Paint the new person into the clip's FIRST and LAST frame (Qwen-Image-Edit-2511 on this Modal GPU, no outside key) and write
+    fit_ref.png, the reference Wan generates from. Frames whose edit fails the guards are dropped; if none pass, nothing is written
+    and Wan gets the user's own photo."""
+    if "/opt" not in sys.path:
+        sys.path.insert(0, "/opt")
+    import fitref
+    import swap_service as ss
+    import texture_service as ts
+    cache.reload()
+    d = ts.job_dir(JOBS, job)
+    meta = ts.read_meta(d)
+    for n in ("fit_first.png", "fit_last.png", "fit_ref.png"):
+        (d / n).unlink(missing_ok=True)
+    ss.record_fit(JOBS, job, {"state": "working", "message": "Fitting the photo to the first and last frame."})
+    cache.commit()
+    try:
+        result = fitref.run_fit(d, _qwen_editor(), ref_photo=d / meta["ref"])
+    except Exception as e:
+        ss.record_fit(JOBS, job, {"state": "error", "message": _friendly(e, "Fitting the photo to the clip failed, so your own photo is used.")})
+        cache.commit()
+        raise
+    ss.record_fit(JOBS, job, result)
+    cache.commit()
+    return result
+
+
+@app.local_entrypoint()
+def fit(job: str):
+    """Fit-only test on an existing job (a mask check must have been done): modal run app.py::fit --job <id>"""
+    print(fit_job.remote(job))
+
+
 @app.function(image=image, gpu=["L4", "A10G", "L40S"], volumes={"/cache": cache}, timeout=3600, max_containers=2)
 def mask_job(job: str):
     """Step 1 (cents): find the person and make the red-overlay preview. A bad mask costs almost nothing to find out here."""
@@ -294,6 +388,22 @@ def swap_job(job: str):
         ss.fail(JOBS, job, "prepare", "The swap is done, but preparing the texture slider could not start. You can still download the swapped clip.")
         cache.commit()
         raise
+
+
+@app.function(image=light, volumes={"/cache": cache}, cpu=2, timeout=10800 + 3600)
+def generate_job(job: str):
+    """Start of the paid step. With `fit` the reference is first fitted to the clip's first and last frame (fit_job, its own GPU);
+    that can never stop the swap: if it fails or its checks refuse the edit, Wan simply gets the user's own photo as before."""
+    ss, ts = _svc()
+    cache.reload()
+    if ss.request_of(JOBS, job).get("fit"):
+        try:
+            fit_job.remote(job)
+        except Exception as e:
+            cache.reload()
+            ss.record_fit(JOBS, job, {"state": "error", "message": _friendly(e, "Fitting the photo to the clip failed, so your own photo is used.")})
+            cache.commit()
+    swap_job.remote(job)
 
 
 @app.function(image=light, volumes={"/cache": cache}, cpu=2, timeout=1800)
@@ -358,7 +468,7 @@ def web():
     def weights_state():
         return swap_service.weights_state(WEIGHTS, WEIGHTS_FLAGS)
 
-    return swap_api.build_app(JOBS, mask_job.spawn, swap_job.spawn, texture_render_job.spawn, fetch_weights.spawn,
+    return swap_api.build_app(JOBS, mask_job.spawn, generate_job.spawn, texture_render_job.spawn, fetch_weights.spawn,
                               weights_state, before_read=reload, after_write=cache.commit,
                               spawn_prepare=prepare_job.spawn, spawn_facelock=facelock_job.spawn)
 

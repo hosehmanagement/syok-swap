@@ -56,17 +56,24 @@ from texture_service import JobError
 # as "about" and tells the user to read the real figure on their Modal dashboard.
 RATE_PER_SECOND = {"480p": 0.08, "720p": 0.23}
 SWAP_FIXED_USD = 0.10
+FIT_USD = 0.25          # Qwen-Image-Edit on one GPU for two frames, load included (an estimate, not measured: say so)
 MASK_USD = {"480p": 0.10, "720p": 0.30}
 MIN_PER_SECOND = {"480p": 1.5, "720p": 4.2}      # minutes of H100 time per second of source (measured: 5 s took 5-8 min / ~20 min)
 MIN_FIXED = 4
 
 
-def estimate(resolution, seconds):
-    """Rough cost and time of the whole swap for a section of `seconds`. Always says it is an estimate."""
+def estimate(resolution, seconds, fit=False):
+    """Rough cost and time of the whole swap for a section of `seconds`. Always says it is an estimate.
+    `fit` (the reference is fitted to the first and last frame) adds fit_usd and about 3 minutes."""
     swap = round(SWAP_FIXED_USD + RATE_PER_SECOND[resolution] * float(seconds), 2)
-    return {"approx": True, "mask_usd": MASK_USD[resolution], "swap_usd": swap,
-            "total_usd": round(swap + MASK_USD[resolution], 2),
-            "swap_minutes": int(round(MIN_FIXED + MIN_PER_SECOND[resolution] * float(seconds)))}
+    out = {"approx": True, "mask_usd": MASK_USD[resolution], "swap_usd": swap,
+           "total_usd": round(swap + MASK_USD[resolution], 2),
+           "swap_minutes": int(round(MIN_FIXED + MIN_PER_SECOND[resolution] * float(seconds)))}
+    if fit:
+        out["fit_usd"] = FIT_USD
+        out["total_usd"] = round(out["total_usd"] + FIT_USD, 2)
+        out["swap_minutes"] += 3
+    return out
 
 
 def _num(v, name):
@@ -81,14 +88,16 @@ def _num(v, name):
 
 def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", margin="normal", start=0.0, length=0.0,
                  skin=None, skin_ext="", detector=tt.detect_face, face=None, face_ext="", facelock=False, faces=None,
-                 face_detector=None, collage=False, mask_shape=""):
+                 face_detector=None, collage=False, mask_shape="", fit=False):
     """Store the original clip and the new person's photo. Returns the job id; the mask step then runs on a small GPU.
     `faces` is a list of (bytes, ext) candidate photos for face-lock (`face`/`face_ext` is the one-photo form); the best of
     them and the main photo is kept (picker.py). `facelock` asks for the face-lock pass after the swap.
     `collage` (EXPERIMENTAL, needs at least one face photo): Wan gets ref_collage.png (main photo + close-up, collage.py) as
     its reference instead of the main photo; the slider, the face check and face-lock still use the main photo.
     `mask_shape`: "silhouette" (default: the red mask follows the person) or "box" (the old whole-bounding-box mask);
-    swapkit.MASK_SHAPES. Stored in the request only when it is "box", so a default job's request is exactly as before."""
+    swapkit.MASK_SHAPES. Stored in the request only when it is "box", so a default job's request is exactly as before.
+    `fit`: before the swap an image-editing model (fitref.py, on the user's Modal GPU) paints the new person into the clip's first
+    and last frame and Wan gets those two views as its reference; if the edit fails the checks the photo is used as before."""
     resolution = resolution or "480p"
     margin = margin or "normal"
     if resolution not in sk.RESOLUTIONS:
@@ -118,9 +127,11 @@ def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", marg
             request["collage"] = True
         if mask_shape != sk.DEFAULT_MASK_SHAPE:       # same rule: only present when not the default
             request["mask_shape"] = mask_shape
+        if fit:                                       # same rule: only present when on
+            request["fit"] = True
         meta.update(kind="swap", request=request,
                     mask={"state": "queued"}, swap={"state": "idle"}, prepare={"state": "idle"},
-                    facelock={"state": "idle"}, estimate=estimate(resolution, l))
+                    facelock={"state": "idle"}, estimate=estimate(resolution, l, fit=bool(fit)))
         if uploads:
             pick_face(d, meta, uploads, _picker_detector(detector, face_detector))
         elif facelock:
@@ -339,6 +350,11 @@ def request_of(root, job):
     return {"dir": d, "ref": generation_ref(d, meta), "photo": meta["ref"], **meta["request"]}
 
 
+def record_fit(root, job, result):
+    """What the fit step did: {"state": "done"|"skipped"|"error", "message", "frames"} (all safe to show)."""
+    tsvc.set_stage(tsvc.job_dir(root, job), "fit", **{k: result[k] for k in ("state", "message", "frames") if k in result})
+
+
 def mask_ready(root, job, section, stats, head=None):
     tsvc.set_stage(tsvc.job_dir(root, job), "mask", state="ready", section=list(section), stats=stats, head=head,
                    warnings=list(stats.get("warnings") or []))
@@ -444,16 +460,17 @@ def facelock_blocks_render(root, job):
 # A step that is "running" for longer than its Modal time limit (plus a margin) died without writing an answer (out of credits,
 # a restart, a time-out). Say so instead of leaving the card spinning for ever.
 ACTIVE = {"mask": ("queued", "preparing"), "swap": ("queued", "generating"), "prepare": ("queued", "preparing"),
-          "render": ("queued", "rendering"), "facelock": ("queued", "working")}
+          "render": ("queued", "rendering"), "facelock": ("queued", "working"), "fit": ("working",)}
 STUCK_AFTER_SECONDS = {"mask": 3600 + 300, "swap": 10800 + 300, "prepare": 1800 + 300, "render": 3600 + 300,
-                       "facelock": 1800 + 300}
+                       "facelock": 1800 + 300, "fit": 3600 + 300}
 STUCK_MESSAGE = {
     "mask": "The mask step stopped without finishing (Modal's time limit, a restart, or no credit left). Start over.",
     "swap": "The swap stopped without finishing (Modal's time limit, a restart, or no credit left). Check your Modal dashboard, then try again.",
     "prepare": "Preparing the texture slider stopped without finishing. Try again.",
     "render": "The render stopped without finishing. Try again.",
     "facelock": "Face-lock stopped without finishing (Modal's time limit or a restart). Check your Magic Hour dashboard, "
-                "then try again or skip it to use the swap as it is."}
+                "then try again or skip it to use the swap as it is.",
+    "fit": "Fitting the photo to the clip stopped without finishing (Modal's time limit, a restart, or no credit left)."}
 
 
 def _expire_stuck(d, meta, now):
@@ -494,6 +511,8 @@ def status(root, job, now=None):
     out = {"job": job, "mask": m.get("mask", {}), "swap": m.get("swap", {}), "prepare": m.get("prepare", {}),
            "render": m.get("render", {}), "facelock": facelock, "request": m.get("request", {}), "estimate": m.get("estimate"),
            "expires_at": m["created"] + tsvc.JOB_TTL_SECONDS}
+    if m.get("fit"):                          # the reference fitted to the first and last frame: what happened
+        out["fit"] = m["fit"]
     if m.get("collage"):                      # EXPERIMENTAL collage reference: which added photo it used
         out["collage"] = {"face": m["collage"]["face"], "of": m["collage"]["of"]}
     return out
