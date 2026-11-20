@@ -28,9 +28,17 @@ jobs:
             echo "::error::Add MODAL_TOKEN_ID and MODAL_TOKEN_SECRET under Settings > Secrets and variables > Actions."
             exit 1
           fi
+          # Shape check only (never prints the values): ID starts "ak-", secret starts "as-", no spaces or line breaks.
+          case "$MODAL_TOKEN_ID" in ak-*) ;; *) echo "::error::MODAL_TOKEN_ID does not start with ak- . Re-paste the Token ID (not the secret) with no spaces."; exit 1;; esac
+          case "$MODAL_TOKEN_SECRET" in as-*) ;; *) echo "::error::MODAL_TOKEN_SECRET does not start with as- . Re-paste the Token Secret (not the ID) with no spaces."; exit 1;; esac
+          if printf '%s%s' "$MODAL_TOKEN_ID" "$MODAL_TOKEN_SECRET" | grep -q '[[:space:]]'; then
+            echo "::error::A token contains a space or line break. Re-paste it without extra characters."; exit 1
+          fi
       - run: pip install modal
       - name: Deploy (builds the ComfyUI image; the build stops if any node pack fails to load)
+        shell: bash   # bash with pipefail, so a failing modal command fails the step even through tee
         run: modal deploy h3_app.py 2>&1 | tee deploy.log
       - name: Download the model files
         if: ${{ inputs.fetch_models }}
+        shell: bash
         run: modal run h3_app.py::fetch 2>&1 | tee fetch.log
