@@ -1,0 +1,36 @@
+name: deploy Syok Swap H3 engine to my Modal
+# Run this in YOUR OWN copy (fork) of this repo. It puts the H3 engine (h3_app.py) in YOUR Modal account, so Modal bills you.
+# Needs two repository secrets: MODAL_TOKEN_ID and MODAL_TOKEN_SECRET (same as deploy-swap.yml).
+# MiniMax H3 is licensed only OUTSIDE the US, EU, UK and South Korea (see docs/H3_TERRITORY.md and docs/H3.md): you are the licensee.
+on:
+  workflow_dispatch:
+    inputs:
+      fetch_models:
+        description: "Also download the ~51 GB of model files into your Modal Volume (CPU only, a few cents; skipped files are not downloaded twice)"
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - name: Check the two secrets exist
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
+            echo "::error::Add MODAL_TOKEN_ID and MODAL_TOKEN_SECRET under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+      - run: pip install modal
+      - name: Deploy (builds the ComfyUI image; the build stops if any node pack fails to load)
+        run: modal deploy h3_app.py 2>&1 | tee deploy.log
+      - name: Download the model files
+        if: ${{ inputs.fetch_models }}
+        run: modal run h3_app.py::fetch 2>&1 | tee fetch.log
