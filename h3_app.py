@@ -61,6 +61,7 @@ PORT = 8188
 
 GPU_SWAP = os.environ.get("SYOK_H3_GPU", "L40S")
 GPU_CHECK = os.environ.get("SYOK_H3_CHECK_GPU", "L4")
+SWAP_MINUTES = int(os.environ.get("SYOK_H3_SWAP_MINUTES", "240"))   # hard cap on the paid GPU step (the first live test sets 45)
 REGION = [r.strip() for r in os.environ.get("SYOK_H3_REGION", "").split(",") if r.strip()] or None
 HF_SECRET = os.environ.get("SYOK_H3_HF_SECRET", "").strip()
 SECRETS = [modal.Secret.from_name(HF_SECRET)] if HF_SECRET else []
@@ -215,11 +216,11 @@ def check_job(job: str):
 
 
 @app.function(image=image, gpu=GPU_SWAP, region=REGION, memory=65536, volumes={MODELS: models, JOBS: jobs},
-              timeout=4 * 3600, max_containers=1)
+              timeout=SWAP_MINUTES * 60, max_containers=1)
 def swap_job(job: str):
     """The paid step. Run it again on the same job after an error: the Context Loop resumes from the last finished clip."""
     eng = _eng()
-    return _stage(job, "swap", eng.NODES["final"], 4 * 3600 - 300,
+    return _stage(job, "swap", eng.NODES["final"], SWAP_MINUTES * 60 - 300,
                   "The swap failed. Start it again on the same job: it resumes from the last finished clip.")
 
 
@@ -246,6 +247,18 @@ def fetch_models(sources: dict):
     shutil.rmtree(Path(MODELS) / ".partial", ignore_errors=True)
     models.commit()
     return got
+
+
+@app.function(image=light, volumes={MODELS: models}, cpu=1, timeout=300)
+def model_sizes():
+    """Size of every expected model file on the Volume (bytes), so a short or missing download is visible."""
+    eng = _eng()
+    models.reload()
+    out = []
+    for m in eng.MODEL_FILES:
+        f = Path(MODELS) / m["folder"] / m["file"]
+        out.append((f"{m['folder']}/{m['file']}", f.stat().st_size if f.is_file() else None))
+    return out
 
 
 @app.function(image=light, volumes={JOBS: jobs}, cpu=2, timeout=600)
@@ -298,6 +311,15 @@ def fetch(sources: str = ""):
     overrides the verified sources built into h3_engine.MODEL_SOURCES. Without it the built-in sources are used."""
     override = json.loads(Path(sources).read_text()) if sources else {}
     print("\n".join(fetch_models.remote(override)))
+
+
+@app.local_entrypoint()
+def sizes():
+    total = 0
+    for name, n in model_sizes.remote():
+        print(f"{name}: {'MISSING' if n is None else f'{n / 1e9:.2f} GB'}")
+        total += n or 0
+    print(f"total {total / 1e9:.1f} GB")
 
 
 @app.local_entrypoint()

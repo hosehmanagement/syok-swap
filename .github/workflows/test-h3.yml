@@ -1,0 +1,58 @@
+name: test Syok Swap H3 engine on my Modal
+# First live test of the H3 engine. Needs MODAL_TOKEN_ID / MODAL_TOKEN_SECRET secrets and a finished "deploy H3" run with model download.
+# Inputs: a licensed stock clip (downloaded at run time) + a fictional AI face (fixtures/h3). No real person's likeness.
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "sizes = free check of the model files | prepare = make the job + mask preview (small L4 GPU, cents) | swap = the paid big-GPU swap (needs job id)"
+        type: choice
+        options: [sizes, prepare, swap]
+        default: sizes
+      job:
+        description: "Job id printed by 'prepare' (only for stage = swap)"
+        type: string
+        default: ""
+permissions:
+  contents: read
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      SYOK_H3_SWAP_MINUTES: "45"   # hard cap on the paid GPU step for this first test
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: pip install modal
+      - name: Model file sizes
+        if: ${{ inputs.stage == 'sizes' }}
+        run: modal run h3_app.py::sizes 2>&1 | tee out.log
+      - name: Prepare (job + mask preview)
+        if: ${{ inputs.stage == 'prepare' }}
+        run: |
+          curl -fsSL -o clip.mp4 https://assets.mixkit.co/videos/28287/28287-720.mp4
+          modal run h3_app.py::new --video clip.mp4 --photo fixtures/h3/fictional_man.jpg --consent yes --length 6 2>&1 | tee new.log
+          JOB=$(grep -o '"job": *"[^"]*"' new.log | head -1 | sed 's/.*: *"//;s/"//')
+          test -n "$JOB"
+          echo "JOB ID: $JOB" | tee -a "$GITHUB_STEP_SUMMARY"
+          modal run h3_app.py::check --job "$JOB" --out check.mp4 2>&1 | tee check.log
+      - name: Swap (paid GPU, capped at 45 minutes)
+        if: ${{ inputs.stage == 'swap' }}
+        run: |
+          test -n "${{ inputs.job }}"
+          modal run h3_app.py::swap --job "${{ inputs.job }}" --out h3.mp4 2>&1 | tee swap.log
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: h3-test-${{ inputs.stage }}
+          path: |
+            *.mp4
+            *.log
+          if-no-files-found: ignore
