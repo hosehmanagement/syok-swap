@@ -73,29 +73,22 @@ SD_MIN = 1.6   # grey levels: a retouched / smooth reference would otherwise giv
 SD_MAX = 4.0   # a very rough reference (stubble, heavy freckles) is not allowed to turn the whole face gritty
 
 
-def make_detail_layer(ref_bgr, ref_box, size_wh, sigma_frac=0.005, clip_mult=2.5, seed=1234):
-    """NEW skin grain with the reference's clean-skin statistics, sized size_wh (w, h).
+NO_SKIN = ("Not enough plain skin in the reference photo (glasses, hair, beard, shadows or heavy make-up "
+           "cover it, or the photo is too small). Use a sharper, evenly lit photo, or add a skin close-up.")
+MAX_SEARCH_SIDE = 2400   # the whole-photo search never works on a picture larger than this (memory and time)
 
-    Returns float32 (h, w): zero mean, soft-clipped. It has the reference's pore size and strength, but none of its
-    features (no eyes, brows, nose or mouth), so nothing is pasted at the wrong place. Same input -> same layer,
-    so a preview and the full render always match.
-    """
-    x, y, w, h = [int(round(v)) for v in pad_box(ref_box)]
-    H, W = ref_bgr.shape[:2]
-    x0, y0, x1, y1 = max(0, x), max(0, y), min(W, x + w), min(H, y + h)
-    crop = ref_bgr[y0:y1, x0:x1]
-    if crop.size == 0:
-        raise ValueError("Reference face box is outside the image.")
-    # match the video's pixel scale BEFORE taking the high-pass, otherwise detail would be far finer than the video can show
-    crop = cv2.resize(crop, size_wh, interpolation=cv2.INTER_AREA)
-    sk_mask = skin_prob(crop)
-    y_ch = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    sigma = max(1.0, sigma_frac * size_wh[0])
+
+def _skin_grain(bgr, sigma):
+    """Plain-skin statistics of one picture already at the video's pixel scale: (hf, clean, patches) or None.
+
+    The rules are the same wherever the skin is: skin coloured, no feature edges, patches at least 96% clean."""
+    sk_mask = skin_prob(bgr)
+    y_ch = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
     hf = y_ch - cv2.GaussianBlur(y_ch, (0, 0), sigma)
     hh, ww = hf.shape
-    patches, clean = [], None
     for k_e in (1.6, 2.2, 3.0):                                  # strict first; looser only if the photo has little plain skin
         clean = _clean_skin_mask(y_ch, hf, sk_mask, sigma, k_e)
+        patches = []
         for p in (64, 48, 32, 24, 16):
             if min(hh, ww) < p * 2:
                 continue
@@ -105,15 +98,50 @@ def make_detail_layer(ref_bgr, ref_box, size_wh, sigma_frac=0.005, clip_mult=2.5
             if len(patches) >= 3:
                 break
         if len(patches) >= 3 and int(clean.sum()) >= 400:
-            break
-    if len(patches) < 3 or int(clean.sum()) < 400:
-        raise ValueError("Not enough plain skin in the reference photo (glasses, hair, beard, shadows or heavy make-up "
-                         "cover it). Use a sharper, evenly lit, front-facing photo.")
+            return hf, clean, patches
+    return None
+
+
+def make_detail_layer(ref_bgr, ref_box, size_wh, sigma_frac=0.005, clip_mult=2.5, seed=1234):
+    """NEW skin grain with the reference's clean-skin statistics, sized size_wh (w, h).
+
+    Returns float32 (h, w): zero mean, soft-clipped. It has the reference's pore size and strength, but none of its
+    features (no eyes, brows, nose or mouth), so nothing is pasted at the wrong place. Same input -> same layer,
+    so a preview and the full render always match.
+
+    The face is looked at first. When the face has too little plain skin (glasses, or a tiny face in a full-body
+    photo), the SAME rules are applied to the whole photo at the same pixel scale: only statistics are taken, so it
+    does not matter where on the body the plain skin is. ref_box None = a skin close-up with no face: whole picture.
+    """
+    H, W = ref_bgr.shape[:2]
+    sigma = max(1.0, sigma_frac * size_wh[0])
+    found = None
+    if ref_box is not None:
+        x, y, w, h = [int(round(v)) for v in pad_box(ref_box)]
+        x0, y0, x1, y1 = max(0, x), max(0, y), min(W, x + w), min(H, y + h)
+        crop = ref_bgr[y0:y1, x0:x1]
+        if crop.size == 0:
+            raise ValueError("Reference face box is outside the image.")
+        # match the video's pixel scale BEFORE taking the high-pass, otherwise detail would be far finer than the video can show
+        found = _skin_grain(cv2.resize(crop, size_wh, interpolation=cv2.INTER_AREA), sigma)
+        scale = size_wh[0] / float(max(1, w))                     # same pixel scale as the face crop above
+    else:
+        scale = size_wh[0] / float(max(1, min(W, H)))             # a close-up: its short side is about one face wide
+    if found is None:
+        scale = min(scale, MAX_SEARCH_SIDE / float(max(W, H)))
+        whole = cv2.resize(ref_bgr, (max(1, int(round(W * scale))), max(1, int(round(H * scale)))),
+                           interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+        found = _skin_grain(whole, sigma)
+    if found is None:
+        raise ValueError(NO_SKIN)
+    src_hf, clean, patches = found
+    ww, hh = int(size_wh[0]), int(size_wh[1])
+    hf = src_hf
     freqs, amps = _radial_profile(patches)
     sd = float(hf[clean].std())                                   # strength of the reference's plain-skin grain
     sd = min(SD_MAX, max(SD_MIN, sd))
     if sd < 1e-6:
-        return np.zeros_like(hf)
+        return np.zeros((hh, ww), np.float32)
     # filter white noise so its spectrum matches the reference skin's, then set its strength to the reference's
     fy, fx = np.fft.fftfreq(hh)[:, None], np.fft.rfftfreq(ww)[None, :]
     filt = np.interp(np.hypot(fy, fx), freqs, amps, left=amps[0], right=amps[-1]).astype(np.float32)
@@ -290,16 +318,44 @@ def clamp_strength(strength):
     return min(MAX_STRENGTH, max(MIN_STRENGTH, v))
 
 
-def prepare(src, ref_path, sigma_frac=0.005, detector=detect_face):
-    """Do the slow, strength-independent work ONCE: find the face in the reference and track it through the clip.
+def face_width_in(src, detector=detect_face, samples=8):
+    """Median face width over a few evenly spaced frames of a clip, or None. Cheap: used before anything is paid for."""
+    info = sk.probe(src)
+    n = max(1, int(round(info["duration"] * info["fps"])))
+    want = {int(round(k * (n - 1) / max(1, samples - 1))) for k in range(samples)}
+    widths = []
+    for i, f in enumerate(sk.frames(src)):
+        if i in want:
+            b, _ = detector(f)
+            if b is not None:
+                widths.append(b[2])
+        if i >= max(want):
+            break
+    return float(np.median(widths)) if widths else None
 
-    Returns a dict that preview_frame()/render_prepared() reuse for any strength, so a slider never re-detects.
-    """
+
+def check_reference(ref_path, face_width=None, sigma_frac=0.005, detector=detect_face, need_face=True):
+    """Raise ValueError (written for the user) when this photo cannot feed the realism slider. Costs no GPU."""
     ref = cv2.imread(str(ref_path))
     if ref is None:
         raise ValueError("Reference image unreadable.")
     ref_box, _ = detector(ref)
-    if ref_box is None:
+    if ref_box is None and need_face:
+        raise ValueError("No face found in the reference image.")
+    w = float(face_width or 160.0)
+    make_detail_layer(ref, ref_box, (int(round(w * PAD[2])), int(round(w * PAD[3]))), sigma_frac)
+
+
+def prepare(src, ref_path, sigma_frac=0.005, detector=detect_face, skin_path=None):
+    """Do the slow, strength-independent work ONCE: find the face in the reference and track it through the clip.
+
+    Returns a dict that preview_frame()/render_prepared() reuse for any strength, so a slider never re-detects.
+    """
+    ref = cv2.imread(str(skin_path or ref_path))
+    if ref is None:
+        raise ValueError("Reference image unreadable.")
+    ref_box, _ = detector(ref)
+    if ref_box is None and not skin_path:                         # a skin close-up needs no face; the main photo does
         raise ValueError("No face found in the reference image.")
     info = sk.probe(src)
     dets = [detector(f) for f in sk.frames(src)]

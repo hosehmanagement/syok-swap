@@ -63,7 +63,35 @@ def _set(d, stage, **kw):
     return meta
 
 
-def new_job(root, video, photo, photo_ext, consent, video_name="src.mp4", meta=None):
+def _skin_ext(skin, skin_ext):
+    """The optional skin close-up: used ONLY for skin-grain statistics, never for the face."""
+    if not skin:
+        return ""
+    ext = (skin_ext or "").lower()
+    if ext not in PHOTO_EXTS:
+        raise JobError("Skin photo must be png, jpg or webp.")
+    if len(skin) > MAX_PHOTO_BYTES:
+        raise JobError(f"Skin photo is larger than {MAX_PHOTO_BYTES // 2**20} MB.")
+    return ext
+
+
+def skin_path(d, meta):
+    return (d / meta["skin"]) if meta.get("skin") else None
+
+
+def set_skin(root, job, skin, skin_ext):
+    """Store or replace the skin close-up of an existing job."""
+    d = _dir(root, job)
+    ext = _skin_ext(skin, skin_ext)
+    meta = _read_meta(d)
+    if meta.get("skin"):
+        (d / meta["skin"]).unlink(missing_ok=True)
+    (d / f"skin{ext}").write_bytes(skin)
+    meta["skin"] = f"skin{ext}"
+    _write_meta(d, meta)
+
+
+def new_job(root, video, photo, photo_ext, consent, video_name="src.mp4", meta=None, skin=None, skin_ext=""):
     """Store the two uploads and return the new job id. The slow work happens later in run_prepare().
 
     The swap service (swap_service.py) reuses this with video_name="raw.mp4": the upload is the ORIGINAL clip there, and
@@ -77,12 +105,15 @@ def new_job(root, video, photo, photo_ext, consent, video_name="src.mp4", meta=N
         raise JobError(f"Video is missing or larger than {MAX_VIDEO_BYTES // 2**20} MB.")
     if not photo or len(photo) > MAX_PHOTO_BYTES:
         raise JobError(f"Photo is missing or larger than {MAX_PHOTO_BYTES // 2**20} MB.")
+    sext = _skin_ext(skin, skin_ext)
     job = uuid.uuid4().hex[:16]
     d = Path(root) / job
     d.mkdir(parents=True)
     try:
         (d / video_name).write_bytes(video)
         (d / f"ref{ext}").write_bytes(photo)
+        if skin:
+            (d / f"skin{sext}").write_bytes(skin)
         try:
             info = sk.probe(d / video_name)
         except Exception:
@@ -91,6 +122,8 @@ def new_job(root, video, photo, photo_ext, consent, video_name="src.mp4", meta=N
             raise JobError(f"Video is longer than {int(sk.MAX_SECONDS)} seconds.")
         base = {"job": job, "created": time.time(), "ref": f"ref{ext}",
                 "prepare": {"state": "queued"}, "render": {"state": "idle"}}
+        if skin:
+            base["skin"] = f"skin{sext}"
         base.update(meta or {})
         _write_meta(d, base)
     except Exception:
@@ -105,7 +138,7 @@ def run_prepare(root, job, detector=tt.detect_face):
     _set(d, "prepare", state="preparing")
     try:
         meta = _read_meta(d)
-        p = tt.prepare(d / "src.mp4", d / meta["ref"], detector=detector)
+        p = tt.prepare(d / "src.mp4", d / meta["ref"], detector=detector, skin_path=skin_path(d, meta))
         np.save(d / "layer.npy", p["layer"])
         (d / "tracks.json").write_text(json.dumps(p["tracks"]))
         info = {k: p[k] for k in ("info", "layer_size", "frames", "detected")}

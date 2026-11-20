@@ -3,8 +3,10 @@
 Routes (all behind Modal's proxy token when deployed):
     GET    /health                 -> {"ok": true, "app": "syok-swap", "weights": "ready|downloading|missing", ...}   free check
     POST   /setup                  one-time: download the model files into the user's Modal volume (starts it if missing)
-    POST   /swap                   multipart: video, photo, consent=yes, resolution, margin, start, length -> {"job", "estimate"}
-                                   (the mask step starts at once on a small GPU: cents)
+    POST   /swap                   multipart: video, photo, consent=yes, resolution, margin, start, length, optional skin
+                                   -> {"job", "estimate"}. Refused (422, nothing charged) when the photo cannot feed the
+                                   realism slider. (the mask step starts at once on a small GPU: cents)
+    POST   /retexture/{job}        multipart: optional skin close-up. Prepare the slider again on a finished swap (CPU only)
     GET    /status/{job}           -> mask / swap / prepare / render stages, the estimate, expires_at
     GET    /mask/{job}             -> the red-overlay preview video (video/mp4) once the mask is ready
     POST   /generate/{job}?relight=true   the PAID step: generate the new person on an H100 (refuses a bad mask or a second run).
@@ -16,6 +18,7 @@ Routes (all behind Modal's proxy token when deployed):
     DELETE /job/{job}
 """
 from pathlib import Path
+from typing import Optional
 
 import swap_service as ss
 import texture_service as svc
@@ -23,7 +26,7 @@ import texture_transfer as tt
 
 
 def build_app(root, spawn_mask, spawn_swap, spawn_render, spawn_weights, weights_state,
-              before_read=lambda: None, after_write=lambda: None):
+              before_read=lambda: None, after_write=lambda: None, spawn_prepare=lambda job: None, detector=tt.detect_face):
     from fastapi import FastAPI, File, Form, UploadFile
     from fastapi.responses import FileResponse, JSONResponse, Response
 
@@ -52,15 +55,28 @@ def build_app(root, spawn_mask, spawn_swap, spawn_render, spawn_weights, weights
 
     @app.post("/swap")
     async def swap(video: UploadFile = File(...), photo: UploadFile = File(...), consent: str = Form(""),
-                   resolution: str = Form("480p"), margin: str = Form("normal"), start: str = Form("0"), length: str = Form("0")):
+                   resolution: str = Form("480p"), margin: str = Form("normal"), start: str = Form("0"), length: str = Form("0"),
+                   skin: Optional[UploadFile] = File(None)):
         before_read()
         if weights_state() != "ready":
             raise svc.JobError("One-time setup is not finished: the model files are not on your Modal account yet.", 409)
+        skin_bytes = (await skin.read()) if skin is not None else None
         job = ss.new_swap_job(root, await video.read(), await photo.read(), Path(photo.filename or "").suffix, consent,
-                              resolution, margin, start, length)
+                              resolution, margin, start, length,
+                              skin=skin_bytes or None, skin_ext=Path((skin.filename if skin is not None else "") or "").suffix,
+                              detector=detector)
         after_write()
         spawn_mask(job)
         return {"job": job, "estimate": ss.status(root, job)["estimate"]}
+
+    @app.post("/retexture/{job}")
+    async def retexture(job: str, skin: Optional[UploadFile] = File(None), retry: str = Form("")):
+        before_read()
+        skin_bytes = (await skin.read()) if skin is not None else None
+        ss.retexture(root, job, skin_bytes or None, Path((skin.filename if skin is not None else "") or "").suffix)
+        after_write()
+        spawn_prepare(job)
+        return {"job": job, "prepare": {"state": "queued"}}
 
     @app.get("/status/{job}")
     def status(job: str):

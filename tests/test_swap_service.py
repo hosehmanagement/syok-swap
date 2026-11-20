@@ -31,13 +31,14 @@ class Rig:
     def __init__(self, tmp_path, weights="ready", mask_warnings=None, mask_runs=True):
         self.root = tmp_path / "jobs"; self.root.mkdir()
         self.tmp = tmp_path
-        self.calls = {"mask": 0, "swap": 0, "render": 0, "weights": 0}
+        self.calls = {"mask": 0, "swap": 0, "render": 0, "weights": 0, "prepare": 0}
         self.weights = weights
         self.mask_warnings = mask_warnings or []
         self.mask_runs = mask_runs
         self.events = []
         app = swap_api.build_app(self.root, self.mask, self.swap, self.render, self.fetch_weights, lambda: self.weights,
-                                 before_read=lambda: self.events.append("r"), after_write=lambda: self.events.append("w"))
+                                 before_read=lambda: self.events.append("r"), after_write=lambda: self.events.append("w"),
+                                 spawn_prepare=self.prepare, detector=FAKE)
         self.c = TestClient(app)
 
     def mask(self, job):
@@ -53,6 +54,10 @@ class Rig:
         d = svc.job_dir(self.root, job)
         final = make_video(d / "fake_final.mp4", SKIN, n=40, fps=24, w=160, h=160, audio=True)
         ss.finish_swap(self.root, job, final, True)
+        svc.run_prepare(self.root, job, detector=FAKE)
+
+    def prepare(self, job):                               # the CPU slider preparation, run again on request
+        self.calls["prepare"] += 1
         svc.run_prepare(self.root, job, detector=FAKE)
 
     def render(self, job):
@@ -96,7 +101,7 @@ def test_whole_flow_through_the_http_layer(tmp_path):
     res = r.c.get(f"/result/{job}")
     assert res.status_code == 200 and res.headers["content-type"] == "video/mp4" and len(res.content) > 1000
     assert r.c.get(f"/swapped/{job}").status_code == 200                              # the plain swap stays reachable
-    assert r.calls == {"mask": 1, "swap": 1, "render": 1, "weights": 0}
+    assert r.calls == {"mask": 1, "swap": 1, "render": 1, "weights": 0, "prepare": 0}
     assert r.c.delete(f"/job/{job}").json() == {"deleted": True}
     assert r.c.get(f"/status/{job}").status_code == 404
 
@@ -270,3 +275,63 @@ def test_modal_app_file_is_one_locked_app_with_cheap_cpu_steps_and_one_paid_step
         assert "image=light" in head and "gpu" not in head, name                         # CPU image, no GPU
     assert "Period(hours=6)" in APP
     assert "prepare_job.spawn(job)" in APP                                               # the slider's tracking starts by itself after the swap
+
+
+# ---------- the realism slider is checked BEFORE anything is paid for, and can be prepared again afterwards ----------
+def png(img):
+    import cv2
+    return cv2.imencode(".png", img)[1].tobytes()
+
+
+def no_skin_photo(size=300):
+    import numpy as np
+    rng = np.random.default_rng(5)
+    return np.clip(np.full((size, size, 3), (200, 90, 40), np.float32) + rng.normal(0, 6, (size, size, 1)), 0, 255).astype(np.uint8)
+
+
+def test_a_photo_that_cannot_feed_the_slider_is_refused_before_any_gpu_step(tmp_path):
+    r = Rig(tmp_path)
+    bad = r.upload(files={"video": ("v.mp4", clip(tmp_path), "video/mp4"), "photo": ("p.png", png(no_skin_photo()), "image/png")})
+    assert bad.status_code == 422
+    msg = bad.json()["error"]
+    assert "realism slider" in msg and "nothing was charged" in msg and "skin close-up" in msg
+    assert r.calls["mask"] == 0 and list(r.root.iterdir()) == []            # nothing started, nothing kept
+
+
+def test_a_skin_close_up_rescues_that_photo_and_is_used_only_for_the_grain(tmp_path):
+    r = Rig(tmp_path)
+    files = {"video": ("v.mp4", clip(tmp_path), "video/mp4"), "photo": ("p.png", png(no_skin_photo()), "image/png"),
+             "skin": ("s.png", photo_bytes(), "image/png")}
+    up = r.upload(files=files)
+    assert up.status_code == 200 and r.calls["mask"] == 1
+    job = up.json()["job"]
+    d = r.root / job
+    assert (d / "skin.png").exists() and (d / "ref.png").read_bytes() == png(no_skin_photo())   # the face photo is untouched
+    r.c.post(f"/generate/{job}")
+    assert r.c.get(f"/status/{job}").json()["prepare"]["state"] == "ready"
+    # a bad skin photo is refused the same way, and so is a wrong file type
+    files["skin"] = ("s.png", png(no_skin_photo()), "image/png")
+    assert r.upload(files=files).status_code == 422
+    files["skin"] = ("s.gif", photo_bytes(), "image/gif")
+    assert r.upload(files=files).status_code == 400
+
+
+def test_the_slider_can_be_prepared_again_on_a_finished_swap_without_a_new_swap(tmp_path):
+    r = Rig(tmp_path)
+    job = r.upload().json()["job"]
+    assert r.c.post(f"/retexture/{job}", data={"retry": "1"}).status_code == 409          # no swap yet
+    r.c.post(f"/generate/{job}")
+    d = r.root / job
+    svc.set_stage(d, "prepare", state="error", message="Not enough plain skin in the reference photo")   # as the real case did
+    for name in ("layer.npy", "tracks.json", "prepared.json"):
+        (d / name).unlink()
+    again = r.c.post(f"/retexture/{job}", files={"skin": ("s.png", photo_bytes(seed=9), "image/png")}, data={"retry": "1"})
+    assert again.status_code == 200 and again.json() == {"job": job, "prepare": {"state": "queued"}}
+    st = r.c.get(f"/status/{job}").json()
+    assert st["prepare"]["state"] == "ready" and not st["prepare"].get("message") and st["render"]["state"] == "idle"
+    assert (d / "skin.png").exists() and r.calls == {"mask": 1, "swap": 1, "render": 0, "weights": 0, "prepare": 1}   # no second paid swap
+    assert r.c.get(f"/preview/{job}", params={"frame": 1, "strength": 2}).status_code == 200
+    # while it is being prepared a second request is refused
+    svc.set_stage(d, "prepare", state="preparing")
+    assert r.c.post(f"/retexture/{job}", data={"retry": "1"}).status_code == 409
+    assert r.c.post("/retexture/0000000000000000", data={"retry": "1"}).status_code == 404

@@ -303,7 +303,8 @@ def web():
         return swap_service.weights_state(WEIGHTS, WEIGHTS_FLAGS)
 
     return swap_api.build_app(JOBS, mask_job.spawn, swap_job.spawn, texture_render_job.spawn, fetch_weights.spawn,
-                              weights_state, before_read=reload, after_write=cache.commit)
+                              weights_state, before_read=reload, after_write=cache.commit,
+                              spawn_prepare=prepare_job.spawn)
 
 
 @app.function(image=image, volumes={"/cache": cache}, cpu=4, timeout=900)

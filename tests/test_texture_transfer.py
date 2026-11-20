@@ -240,3 +240,50 @@ def test_prepare_refuses_when_no_face(tmp_path):
     ref = tmp_path / "r.png"; cv2.imwrite(str(ref), np.full((64, 64, 3), 120, np.uint8))
     with pytest.raises(ValueError):
         tt.prepare(src, ref, detector=lambda f: (None, 0.0))
+
+
+# ---------- plain skin is looked for in the whole photo when the face has too little (full-body photos, glasses) ----------
+def full_body_photo(face=(130, 20, 40, 40), seed=4):
+    """A 300x450 'full-body' picture: a tiny face covered by hard stripes (no plain skin there), plain grainy skin lower down."""
+    rng = np.random.default_rng(seed)
+    img = np.full((450, 300, 3), (90, 90, 90), np.float32)
+    img[150:400, 60:240] = np.array(SKIN, np.float32) + rng.normal(0, 5, (250, 180, 1))
+    x, y, w, h = face
+    fx0, fy0, fx1, fy1 = x - 8, y - 8, x + w + 16, y + h + 20
+    img[fy0:fy1, fx0:fx1] = SKIN
+    img[fy0:fy1:4, fx0:fx1] = (20, 20, 20)                      # stripes every 4 px: edges everywhere, like frames and hair
+    return np.clip(img, 0, 255).astype(np.uint8), face
+
+
+def test_face_without_plain_skin_falls_back_to_plain_skin_elsewhere_in_the_photo():
+    img, face = full_body_photo()
+    x, y, w, h = [int(round(v)) for v in tt.pad_box(face)]
+    crop = cv2.resize(img[max(0, y):y + h, max(0, x):x + w], (96, 104), interpolation=cv2.INTER_AREA)
+    assert tt._skin_grain(crop, 1.0) is None                    # the face alone is refused, exactly as before
+    layer = tt.make_detail_layer(img, face, (96, 104))
+    assert layer.shape == (104, 96) and abs(float(layer.mean())) < 0.2
+    assert tt.SD_MIN * 0.5 < float(layer.std()) < tt.SD_MAX * 1.2
+    assert np.array_equal(layer, tt.make_detail_layer(img, face, (96, 104)))   # preview and render still match
+
+
+def test_no_plain_skin_anywhere_is_still_refused_and_a_close_up_needs_no_face():
+    img, face = full_body_photo()
+    img[150:400, 60:240] = (200, 90, 40)                        # the body skin is gone too
+    img[0:100, 100:200] = (200, 90, 40)                         # and the face is fully covered (a mask, a helmet)
+    with pytest.raises(ValueError, match="Not enough plain skin"):
+        tt.make_detail_layer(img, face, (96, 104))
+    rng = np.random.default_rng(1)
+    close = np.clip(np.array(SKIN, np.float32) + rng.normal(0, 5, (200, 260, 1)), 0, 255).astype(np.uint8)
+    assert tt.make_detail_layer(close, None, (96, 104)).shape == (104, 96)    # box None = skin close-up
+
+
+def test_check_reference_and_face_width(tmp_path):
+    img, face = full_body_photo()
+    p = tmp_path / "ref.png"; cv2.imwrite(str(p), img)
+    tt.check_reference(p, 80, detector=lambda f: (face, 1.0))                  # passes thanks to the body skin
+    with pytest.raises(ValueError, match="No face found"):
+        tt.check_reference(p, 80, detector=lambda f: (None, 0.0))
+    tt.check_reference(p, None, detector=lambda f: (None, 0.0), need_face=False)   # allowed for a skin close-up
+    v = make_video(tmp_path / "v.mp4", SKIN, n=20, fps=10, w=160, h=160)
+    assert tt.face_width_in(v, detector=lambda f: ((10, 10, 50, 60), 1.0)) == 50
+    assert tt.face_width_in(v, detector=lambda f: (None, 0.0)) is None

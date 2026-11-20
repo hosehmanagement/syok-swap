@@ -294,7 +294,7 @@ def mask_stats(mask):
     if stats["mean"] < 0.01:
         stats["warnings"].append("Mask is almost empty: no person was found. Do not generate.")
     if stats["max"] > 0.85:
-        stats["warnings"].append("Mask covers almost the whole frame: the result will be a full re-render.")
+        stats["warnings"].append("At some point the person fills most of the picture, so most of it (background included) is redrawn there. This is normal for close-ups.")
     return stats
 
 
