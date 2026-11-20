@@ -31,6 +31,7 @@ import json
 import math
 import re
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -387,6 +388,23 @@ STUCK_MESSAGE = {
             "same job: it resumes from the last finished clip."}
 
 
+def add_silent_audio(path, probe, run=subprocess.run):
+    """VHS_LoadVideo always pulls the audio track and fails on a silent clip (found in the first live run). If the
+    source has no audio, mux in a silent AAC track (video stream copied, nothing re-encoded). Returns True if it changed the file."""
+    if probe(path).get("has_audio"):
+        return False
+    path = Path(path)
+    tmp = path.with_name("with_audio_" + path.name)
+    cmd = ["ffmpeg", "-v", "error", "-y", "-i", str(path), "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+           "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-shortest", str(tmp)]
+    r = run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not tmp.is_file():
+        tmp.unlink(missing_ok=True)
+        raise JobError("That video has no sound and a silent track could not be added. Use an MP4 with audio.")
+    tmp.replace(path)
+    return True
+
+
 def new_h3_job(root, video, photo, photo_ext, consent, probe, **settings):
     """Store the source video and the new person's photo, freeze the settings, return the job id. Nothing runs yet.
     `probe(path) -> {"duration": seconds, ...}` reads the video (swapkit.probe in production; a fake in tests)."""
@@ -402,6 +420,7 @@ def new_h3_job(root, video, photo, photo_ext, consent, probe, **settings):
         except Exception:
             raise JobError("That video could not be read. Use an MP4.")
         s["start"], s["length"] = plan_section(duration, s["start"], s["length"])
+        add_silent_audio(d / VIDEO_NAME, probe)
         meta = tsvc.read_meta(d)
         meta.update(request=s, duration=duration, clips=clip_count(s["length"], s["clip_seconds"]),
                     check={"state": "idle"}, swap={"state": "idle", "attempts": 0})
