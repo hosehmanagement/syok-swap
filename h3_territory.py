@@ -1,7 +1,6 @@
 """Territory gate and UI strings for a possible MiniMax H3 swap engine. Pure Python, no network, nothing touches a GPU.
 
-Used by the H3 engine's web API (h3_api.py, behind h3_app.web) only. The Wan engine (app.py / swap_api.py /
-swap_service.py, Apache-2.0) does not import this file.
+Used by the H3 engine's web API (h3_api.py, behind h3_app.web).
 
 The H3 Community License excludes the US, the EU, the UK and South Korea. This module is a SAFEGUARD written with the
 licence's section V.5 in mind (see docs/H3_TERRITORY.md). It does NOT make anything legally compliant: the country comes

@@ -94,8 +94,7 @@ def set_skin(root, job, skin, skin_ext):
 def new_job(root, video, photo, photo_ext, consent, video_name="src.mp4", meta=None, skin=None, skin_ext=""):
     """Store the two uploads and return the new job id. The slow work happens later in run_prepare().
 
-    The swap service (swap_service.py) reuses this with video_name="raw.mp4": the upload is the ORIGINAL clip there, and
-    src.mp4 only appears once the swap has made the swapped clip the texture slider works on. `meta` adds keys to meta.json."""
+    The H3 engine (h3_engine.new_h3_job) reuses this with its own video_name; `meta` adds keys to meta.json."""
     if consent != "yes":
         raise JobError("Only use photos and videos of people who agreed to it (or fictional characters). Send consent=yes.")
     ext = (photo_ext or "").lower()

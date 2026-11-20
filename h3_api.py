@@ -1,5 +1,5 @@
 """HTTP face of the Syok Swap H3 engine (MiniMax H3 through openjutsu, on the user's own Modal). Plain FastAPI, no Modal
-import, so it is testable with TestClient (same pattern as swap_api.build_app). h3_app.web wires it to the real Modal
+import, so it is testable with TestClient. h3_app.web wires it to the real Modal
 functions (check_job / swap_job / fetch_models) behind Modal's proxy token (requires_proxy_auth=True).
 
 Territory (H3 Community License excludes the US, the EU, the UK and South Korea; see docs/H3_TERRITORY.md):

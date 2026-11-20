@@ -98,11 +98,6 @@ def test_record_refused_after_wording_change_or_tamper():
         h3.verify_territory_record({**rec, "attest": {}})
 
 
-def test_not_wired_into_the_live_wan_app():
-    for name in ("app.py", "swap_api.py", "swap_service.py"):
-        assert "h3_territory" not in (ROOT / name).read_text()
-
-
 def test_worker_blocked_list_matches_python():
     js = WORKER.read_text()
     block = js.split("const BLOCKED = new Set([", 1)[1].split("]);", 1)[0]
