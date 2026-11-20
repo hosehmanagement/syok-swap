@@ -16,6 +16,24 @@ import numpy as np
 
 # (iterations, kernel) for Wan's mask dilation in preprocess_data.py. normal == Wan's default.
 MARGINS = {"tight": (2, 5), "normal": (3, 7), "loose": (4, 9)}
+# (w_len, h_len): the grid of Wan's get_aug_mask (wan/modules/animate/preprocess/utils.py), passed as --w_len / --h_len to
+# preprocess_data.py. Wan fills every grid cell of the person's bounding box that touches the (dilated) SAM2 mask. Wan's CLI
+# default is 1 x 1: ONE cell, so the WHOLE bounding box is filled (the wide red rectangle over the hedge, found 20 Nov 2026).
+# "silhouette" uses get_aug_mask's own default grid (10 x 20 cells), so the mask follows the person's outline in cells of
+# 1/10 of the person's width and 1/20 of their height. "box" is the old behaviour, kept reachable.
+MASK_SHAPES = {"silhouette": (10, 20), "box": (1, 1)}
+DEFAULT_MASK_SHAPE = "silhouette"
+
+
+def preprocess_mask_args(margin, mask_shape=DEFAULT_MASK_SHAPE):
+    """The mask flags for Wan's preprocess_data.py in replace mode: dilation (margin) and grid (mask shape)."""
+    if margin not in MARGINS:
+        raise ValueError("Margin must be tight, normal or loose.")
+    if mask_shape not in MASK_SHAPES:
+        raise ValueError("Mask shape must be silhouette or box.")
+    it, k = MARGINS[margin]
+    wl, hl = MASK_SHAPES[mask_shape]
+    return ["--iterations", str(it), "--k", str(k), "--w_len", str(wl), "--h_len", str(hl)]
 RESOLUTIONS = {"480p": (832, 480), "720p": (1280, 720)}  # target AREA as [w, h]
 MAX_SECONDS = 30.0
 
@@ -203,7 +221,7 @@ def _median_filter(vals, window=9):
 
 def head_boxes(masks, faces):
     """Wan's replace mask can stop at the face or neck: Wan prompts SAM2 with body points and then fills the mask's whole
-    bounding box, so when SAM2 leaves the head out the ORIGINAL head stays in the background video and comes back through
+    bounding box (with the 1 x 1 grid: MASK_SHAPES["box"]; head_ellipses() is the silhouette version), so when SAM2 leaves the head out the ORIGINAL head stays in the background video and comes back through
     the result (found 2026-11-18: the top 31% of the mask was never marked and the original red-haired head returned in
     the head-turn frames).
     masks: per-frame 2-D arrays (>127 = person); faces: per-frame (x, y, w, h) in mask pixels or None, detected on the
@@ -239,11 +257,80 @@ def head_boxes(masks, faces):
     return out
 
 
-def cover_head_files(proc_dir, section, face_fn=None):
+HEAD_HALF_WIDTH = 1.2      # head ellipse half-width, in face-box widths (the old rectangle was 2.8 face widths wide)
+HEAD_TOP = 1.0             # top of the head ellipse above the face box top, in face-box heights (hair room)
+HEAD_BOTTOM = 1.15         # bottom of the head ellipse below the face box top, in face-box heights (chin and a bit of neck)
+
+
+def head_ellipses(masks, faces):
+    """Head-shaped version of head_boxes() for the silhouette mask: per frame an ellipse around the face and the hair, as
+    dict(ellipse=(cx, cy, half_w, half_h), face=(x0, y0, x1, y1) or None), or None when the frame's mask is empty.
+    The ellipse spans HEAD_TOP face heights above the face box to HEAD_BOTTOM below its top and HEAD_HALF_WIDTH face widths
+    either side of its centre, which always contains the face box itself; the detected face box is ALSO returned so it is
+    filled as a rectangle too (a detected face is never left outside the mask, whatever the ellipse maths does).
+    Frames without a detection take the position interpolated from the frames that have one, smoothed over time, as in
+    head_boxes(). Raises if no face was found anywhere."""
+    if not any(f is not None for f in faces):
+        raise ValueError("No face was detected in any frame, so the head cannot be added to the mask.")
+    idx = [i for i, f in enumerate(faces) if f is not None]
+
+    def per_frame(vals):
+        v = np.interp(np.arange(len(faces)), idx, [vals[i] for i in idx])
+        return _median_filter(list(v))
+
+    cxs = per_frame([None if f is None else f[0] + f[2] / 2 for f in faces])
+    tops = per_frame([None if f is None else f[1] - HEAD_TOP * f[3] for f in faces])
+    bots = per_frame([None if f is None else f[1] + HEAD_BOTTOM * f[3] for f in faces])
+    hws = per_frame([None if f is None else HEAD_HALF_WIDTH * f[2] for f in faces])
+    out = []
+    for m, f, cx, t, b, hw in zip(masks, faces, cxs, tops, bots, hws):
+        if not (m > 127).any():
+            out.append(None)
+            continue
+        face = None
+        if f is not None:                       # this frame's own detection wins over the smoothed track
+            cx, face = f[0] + f[2] / 2, (f[0], f[1], f[0] + f[2], f[1] + f[3])
+            t, b, hw = min(t, f[1] - HEAD_TOP * f[3]), max(b, f[1] + HEAD_BOTTOM * f[3]), max(hw, HEAD_HALF_WIDTH * f[2])
+        out.append({"ellipse": (cx, (t + b) / 2, hw, (b - t) / 2), "face": face})
+    return out
+
+
+def head_region(shape, head):
+    """Boolean (h, w) array of one head_ellipses() entry: the ellipse plus the face box."""
+    h, w = shape
+    r = np.zeros((h, w), np.uint8)
+    if head is None:
+        return r.astype(bool)
+    cx, cy, hw, hh = head["ellipse"]
+    cv2.ellipse(r, (int(round(cx)), int(round(cy))), (int(np.ceil(hw)) + 1, int(np.ceil(hh)) + 1), 0, 0, 360, 1, -1)
+    if head["face"] is not None:
+        x0, y0, x1, y1 = head["face"]
+        r[max(0, int(np.floor(y0))):max(0, int(np.ceil(y1)) + 1), max(0, int(np.floor(x0))):max(0, int(np.ceil(x1)) + 1)] = 1
+    return r.astype(bool)
+
+
+def _bbox_fill(m):
+    """What Wan's 1 x 1 grid makes of a mask: its whole bounding box."""
+    out = np.zeros_like(m, dtype=bool)
+    ys, xs = np.nonzero(m)
+    if len(ys):
+        out[ys.min():ys.max() + 1, xs.min():xs.max() + 1] = True
+    return out
+
+
+def cover_head_files(proc_dir, section, face_fn=None, shape="box"):
     """Rebuild Wan's src_mask.mp4 and src_bg.mp4 in proc_dir with the head inside the mask. Faces are detected on the
     ORIGINAL section frames (the background video has the lower face blacked out when the mask reaches it), matched by time
     and scaled to the mask's size. The old files are kept as *_nohead.mp4.
-    Returns stats: frames, frames with a detected face, frames extended, mean extension in pixels."""
+    shape "box" (the old behaviour): a rectangle from above the hair down to the mask's top (head_boxes()).
+    shape "silhouette": a head-shaped ellipse plus the detected face box (head_ellipses()), so the head is covered without a
+    wide block of background. In both, the background video is blacked out exactly where the mask is added, as Wan builds
+    it (src_bg = frame * (1 - mask)), and the two videos keep the same frames.
+    Returns stats: frames, frames with a detected face, frames extended, mean extension in pixels, and "coverage": the mean
+    share of the frame in Wan's mask before the head was added (wan_mean), after (final_mean), and what the old box path
+    would have covered on this same mask (box_mean: Wan's mask filled to its bounding box plus the old head rectangle)."""
+    if shape not in MASK_SHAPES:
+        raise ValueError("Mask shape must be silhouette or box.")
     proc = Path(proc_dir)
     face_fn = face_fn or detect_face_box
     bg_p, mk_p = proc / "src_bg.mp4", proc / "src_mask.mp4"
@@ -261,27 +348,56 @@ def cover_head_files(proc_dir, section, face_fn=None):
         f = cache[si]
         faces.append(None if f is None else (f[0] * sx, f[1] * sy, f[2] * sx, f[3] * sy))
     gray = [f.max(axis=2) for f in mk]
-    boxes = head_boxes(gray, faces)
+    hh, ww = gray[0].shape
+    # what the old box path makes of this same person mask: bounding box + head rectangle (for the coverage comparison)
+    filled = [_bbox_fill(g > 127) for g in gray]
+    old_boxes = head_boxes([f.astype(np.uint8) * 255 for f in filled], faces)
+    box_cover = []
+    for f, b in zip(filled, old_boxes):
+        f = f.copy()
+        if b is not None:
+            f[b[1]:b[3], b[0]:b[2]] = True
+        box_cover.append(float(f.mean()))
+    if shape == "box":
+        boxes = head_boxes(gray, faces)
+        adds = []
+        for b in boxes:
+            a = np.zeros((hh, ww), bool)
+            if b is not None:
+                a[b[1]:b[3], b[0]:b[2]] = True
+            adds.append(a)
+    else:
+        heads = head_ellipses(gray, faces)
+        adds = [head_region((hh, ww), x) for x in heads]
     shutil.copy(bg_p, proc / "src_bg_nohead.mp4")
     shutil.copy(mk_p, proc / "src_mask_nohead.mp4")
     wb = Writer(bg_p, info["width"], info["height"], info["fps"])
     wm = Writer(mk_p, info["width"], info["height"], info["fps"])
+    wan_cover, final_cover, ext = [], [], []
     try:
-        for f, g, b in zip(bg, gray, boxes):
+        for f, g, a in zip(bg, gray, adds):
+            on = g > 127
+            wan_cover.append(float(on.mean()))
+            new = a & ~on
+            if new.any():
+                ys = np.nonzero(on)[0]
+                top = int(ys.min()) if len(ys) else hh
+                ext.append(max(0, top - int(np.nonzero(a)[0].min())))
             g = g.copy()
             f = f.copy()
-            if b is not None:
-                x0, y0, x1, y1 = b
-                g[y0:y1, x0:x1] = 255
-                f[y0:y1, x0:x1] = 0
+            g[a] = 255
+            f[g > 127] = 0          # bg = frame * (1 - mask) everywhere, as Wan builds it (also clears codec bleed at old edges)
+            final_cover.append(float((g > 127).mean()))
             wm.put(np.repeat(g[..., None], 3, axis=2))
             wb.put(f)
     finally:
         wb.close()
         wm.close()
     return {"frames": len(bg), "faces_detected": sum(1 for f in faces if f is not None),
-            "frames_extended": sum(1 for b in boxes if b is not None),
-            "mean_extension_px": float(np.mean([b[3] - b[1] for b in boxes if b is not None])) if any(boxes) else 0.0}
+            "frames_extended": len(ext), "mean_extension_px": float(np.mean(ext)) if ext else 0.0,
+            "head_shape": "rectangle" if shape == "box" else "ellipse", "mask_shape": shape,
+            "coverage": {"wan_mean": float(np.mean(wan_cover)), "final_mean": float(np.mean(final_cover)),
+                         "box_mean": float(np.mean(box_cover))}}
 
 
 def mask_stats(mask):

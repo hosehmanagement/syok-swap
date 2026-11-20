@@ -15,7 +15,7 @@ Every swap result has the texture strength slider (0 to 3, starts at 2.0) built 
 The endpoint refuses every request without your proxy token (`requires_proxy_auth=True`).
 
 ## Flow (what the Syok card does)
-1. `POST /swap` (video, photo, consent=yes, resolution, margin, start, length) returns the job and an approximate cost estimate. A cheap GPU builds the mask preview.
+1. `POST /swap` (video, photo, consent=yes, resolution, margin, start, length, optional mask_shape) returns the job and an approximate cost estimate. A cheap GPU builds the mask preview.
 2. You check the mask (`GET /mask/{job}`), then confirm. `POST /generate/{job}` runs the paid H100 swap (once per job).
 3. Face tracking starts automatically on the swapped clip. Then the slider works: `GET /preview/{job}?frame=N&strength=S` (one frame),
    `POST /render/{job}?strength=S` (full render), `GET /result/{job}`. `GET /swapped/{job}` is the plain swap without texture.
@@ -24,6 +24,41 @@ The endpoint refuses every request without your proxy token (`requires_proxy_aut
    close-up, and refuses (422, nothing charged) a photo that cannot feed the slider. `POST /retexture/{job}` (optional `skin`)
    prepares the slider again on a finished swap, CPU only.
 5. `GET /status/{job}`, `DELETE /job/{job}`, `GET /health`, `POST /setup`.
+
+## Mask shape: silhouette (default) or box
+
+**What was wrong (reported 20 Nov 2026 from a live mask check):** the red "will be replaced" area was a wide rectangle around
+the person (the hedge on both sides of the body was inside it) plus another rectangle over the head. Wan redraws everything
+inside the mask, so that background changed in the result.
+
+**Why:** Wan's `preprocess_data.py` (pinned commit `1ea34ff`) makes the mask in three steps: SAM2 finds the person from body
+points (`process_pipepline.py` `get_mask`), the mask is dilated by the margin (`utils.get_mask_body_img`, `--iterations/--k`),
+then `utils.get_aug_mask` splits the person's bounding box into a `--w_len` x `--h_len` grid and fills every cell the person
+touches. Both default to **1**, so there is one cell and the **whole bounding box** is filled. We never passed them. On top of
+that, our head fix (`swapkit.head_boxes`) added a rectangle 2.8 face-widths wide above the mask.
+
+**What changed:**
+- `mask_shape=silhouette` (default): `--w_len 10 --h_len 20` (the grid `get_aug_mask` itself defaults to), so the mask follows
+  the person's outline in cells of 1/10 of their width and 1/20 of their height. The margin still dilates the outline first,
+  so the person is never cut: every SAM2 pixel stays inside.
+- The head is added as an ellipse around the face and hair (2.4 face-widths wide, from 1 face-height above the face box to just
+  below the chin) plus the detected face box itself, so a detected face can never be outside the mask, and frames where the
+  face is not detected use the smoothed position from the frames where it is (same as before).
+- `src_bg.mp4` is blacked out wherever the final mask is, exactly as Wan builds it (`frame * (1 - mask)`), and keeps the same
+  frames as `src_mask.mp4`.
+- A small build-time patch (`patch_wan_mask.py`) keeps Wan's grid from crashing when the person is tinier than the grid
+  (under 10 px wide or 20 px tall in a frame); it changes nothing for anything larger. The image build fails if Wan's file
+  ever changes, so this can never break silently in a paid run.
+- `mask_shape=box` on `POST /swap` (or `--mask-shape box` on `modal run app.py::preview`) gives the old behaviour.
+- `status.mask.stats` now has `mask_shape` and `box_mean`: the share of the picture the old box mask would have covered on the
+  same clip, next to `mean` (what this mask covers), so the card can show "covers X% instead of Y%". `status.mask.head.coverage`
+  has the details.
+
+**What is NOT measured:** this has only been tested on synthetic frames on a CPU (a moving ellipse "person" on a noisy green
+"hedge", with Wan's own grid code). Nobody has run it on a GPU with real footage yet, so it is unknown how SAM2's real outline,
+hair, loose clothes or a held object come out, or whether the tighter mask lets the original body shape show through ("shape
+leakage", which Wan's own guide warns can happen with a finer mask). **Always look at the red preview (about $0.10 at 480p)
+before paying for the swap.** If the red area cuts into the person, use margin `loose`, or `mask_shape=box`.
 
 ## Face-lock (optional, uses YOUR Magic Hour account)
 Wan2.2-Animate redraws the whole person from one photo, so the face is close but not exactly the person in the photo.
