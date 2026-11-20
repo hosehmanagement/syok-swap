@@ -73,4 +73,25 @@ code picks the one it can copy best.
     40% as wide is in the photo (which person to copy would be ambiguous).
   - `score = S^1.5 x front x (0.4 + 0.6 x sharp) x E x M`. A profile never beats a photo that is not a profile; equal scores
     go to the larger face, then to the earlier photo. Photos without a face are never chosen.
+## Collage reference (EXPERIMENTAL, off by default)
+Wan2.2-Animate generates the new person from ONE reference image. In a full-body photo the face is small, so this option gives
+Wan one image that holds the full-body photo AND a sharp head-and-shoulders close-up of the same person, side by side.
+
+**Nobody has measured yet whether this gives a better likeness.** It is an experiment to test. Wan may also misread the
+collage and draw two people, or a split image. Leave it off unless you are testing it.
+
+- `POST /swap` with `collage=yes` (also `1` or `true`; anything else, or no field, means off) and at least one `face` photo.
+  With `collage` on and no `face` photo: 422 `{"error": "Collage needs a face close-up."}`, nothing stored, nothing charged.
+  `consent=yes` is still required.
+- The close-up is the face photo the best-photo pick chose. When your main photo wins that pick, the best of the photos you
+  ADDED is used instead (same scoring), so the main photo never appears twice.
+- `collage.py` builds `ref_collage.png` at upload (CPU, no GPU): main photo on the left, the close-up cropped to head and
+  shoulders (YuNet, the same detector as the pick; a top-centre crop when no face is found) on the right, both scaled to the
+  same height without stretching, a small gap, background colour taken from the main photo's border, transparent parts
+  flattened onto it, EXIF orientation applied, at most 1536 px on the longer side. The same photos always give the same image.
+- Only the generation uses the collage (it is the reference the mask step hands to Wan). The realism slider, the photo check
+  before paying and face-lock keep using your ORIGINAL main photo, exactly as without the collage.
+- `meta.json` / `status.request` get `"collage": true` only when it is on (a job without it is exactly as before);
+  `status.collage` = `{"face": N, "of": M}` says which added photo was used. `GET /health` reports `"collage": true`.
+
 Limits: video up to 60 MB, photo up to 8 MB, section up to 30 s. Clothes come from the reference photo.

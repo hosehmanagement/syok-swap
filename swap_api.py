@@ -5,7 +5,10 @@ Routes (all behind Modal's proxy token when deployed):
     POST   /setup                  one-time: download the model files into the user's Modal volume (starts it if missing)
     POST   /swap                   multipart: video, photo, consent=yes, resolution, margin, start, length, optional skin,
                                    optional face (1 to 5 candidate photos for face-lock: repeat the field; each png/jpg/
-                                   webp <= photo_mb, all together <= faces_mb, else 400), facelock=yes|""
+                                   webp <= photo_mb, all together <= faces_mb, else 400), facelock=yes|"",
+                                   collage=yes|1|true (EXPERIMENTAL, off otherwise: Wan gets the main photo + the chosen
+                                   close-up side by side as its one reference; needs at least one face, else 422
+                                   "Collage needs a face close-up.", nothing stored; slider and face-lock keep the main photo)
                                    -> {"job", "estimate"}. The best of the face photos and the main photo is kept
                                    (picker.py); status facelock.pick says which and why. Refused (422, nothing charged) when the photo cannot feed the
                                    realism slider. (the mask step starts at once on a small GPU: cents)
@@ -32,6 +35,11 @@ import picker
 import swap_service as ss
 import texture_service as svc
 import texture_transfer as tt
+
+
+def collage_on(value):
+    """The `collage` form field: "yes", "1" or "true" (any case, spaces ignored) turn it on; anything else is off."""
+    return (value or "").strip().lower() in ("yes", "1", "true")
 
 
 def build_app(root, spawn_mask, spawn_swap, spawn_render, spawn_weights, weights_state,
@@ -64,7 +72,7 @@ def build_app(root, spawn_mask, spawn_swap, spawn_render, spawn_weights, weights
     @app.get("/health")
     def health():
         before_read()
-        return {"ok": True, "app": "syok-swap", "version": 3, "weights": weights_state(), "facelock": True,
+        return {"ok": True, "app": "syok-swap", "version": 3, "weights": weights_state(), "facelock": True, "collage": True,
                 "strength": {"min": tt.MIN_STRENGTH, "max": tt.MAX_STRENGTH, "start": tt.DEFAULT_STRENGTH},
                 "limits": {"video_mb": svc.MAX_VIDEO_BYTES // 2**20, "photo_mb": svc.MAX_PHOTO_BYTES // 2**20,
                            "seconds": int(svc.sk.MAX_SECONDS), "keep_days": svc.JOB_TTL_SECONDS // 86400,
@@ -83,7 +91,7 @@ def build_app(root, spawn_mask, spawn_swap, spawn_render, spawn_weights, weights
     async def swap(video: UploadFile = File(...), photo: UploadFile = File(...), consent: str = Form(""),
                    resolution: str = Form("480p"), margin: str = Form("normal"), start: str = Form("0"), length: str = Form("0"),
                    skin: Optional[UploadFile] = File(None), face: Optional[List[UploadFile]] = File(None),
-                   facelock: str = Form("")):
+                   facelock: str = Form(""), collage: str = Form("")):
         before_read()
         if weights_state() != "ready":
             raise svc.JobError("One-time setup is not finished: the model files are not on your Modal account yet.", 409)
@@ -93,7 +101,7 @@ def build_app(root, spawn_mask, spawn_swap, spawn_render, spawn_weights, weights
                               resolution, margin, start, length,
                               skin=skin_bytes or None, skin_ext=Path((skin.filename if skin is not None else "") or "").suffix,
                               detector=detector, faces=faces, face_detector=face_detector,
-                              facelock=(facelock or "").strip().lower() == "yes")
+                              facelock=(facelock or "").strip().lower() == "yes", collage=collage_on(collage))
         after_write()
         spawn_mask(job)
         return {"job": job, "estimate": ss.status(root, job)["estimate"]}

@@ -21,6 +21,10 @@ Replace the person in a video with a character from **one photo**. Open, self-ho
 **Optional face-lock** after the swap puts the exact face from the photo on the swapped clip with Magic Hour's face swap API,
 on the user's own Magic Hour account (BYOK; only when the user ticks the box), see `docs/SWAP.md`.
 
+**Collage reference (EXPERIMENTAL, off by default):** `collage=yes` gives Wan one image with the full-body photo and a face
+close-up side by side, instead of the full-body photo alone. Nobody has measured yet whether it helps the likeness, and Wan may
+draw two people or a split image. The slider and face-lock still use the original photo. See `docs/SWAP.md`.
+
 Not done yet: multi-person, hat fix, long clips above 30 s.
 
 ## Use

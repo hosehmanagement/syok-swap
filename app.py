@@ -67,7 +67,7 @@ HERE = Path(__file__).parent
 light = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg", "libgl1", "libglib2.0-0")
-    .pip_install("numpy<2", "opencv-python-headless<5", "fastapi[standard]")
+    .pip_install("numpy<2", "opencv-python-headless<5", "fastapi[standard]", "pillow<13")
     .add_local_file(HERE / "swapkit.py", "/opt/swapkit.py")
     .add_local_file(HERE / "texture_transfer.py", "/opt/texture_transfer.py")
     .add_local_file(HERE / "texture_service.py", "/opt/texture_service.py")
@@ -75,6 +75,7 @@ light = (
     .add_local_file(HERE / "swap_api.py", "/opt/swap_api.py")
     .add_local_file(HERE / "facelock.py", "/opt/facelock.py")
     .add_local_file(HERE / "picker.py", "/opt/picker.py")              # best-photo pick for face-lock
+    .add_local_file(HERE / "collage.py", "/opt/collage.py")            # EXPERIMENTAL collage reference, made at upload
     .add_local_file(HERE / "lora" / "face_detection_yunet_2023mar.onnx", "/opt/face_detection_yunet_2023mar.onnx")  # its detector
 )
 WEIGHTS_FLAGS = "/cache"      # .weights-downloading / .weights-ok live next to the model folder
@@ -224,7 +225,7 @@ def mask_job(job: str):
     sk = _sk()
     ss, ts = _svc()
     cache.reload()
-    q = ss.request_of(JOBS, job)
+    q = ss.request_of(JOBS, job)        # q["ref"]: the collage (ref_collage.png) when the job asked for it, else the main photo
     d = q["dir"]
     ts.set_stage(d, "mask", state="preparing")
     cache.commit()

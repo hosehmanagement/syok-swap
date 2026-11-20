@@ -22,6 +22,13 @@ as it is. Either way the slider is then prepared on whatever src.mp4 is.
 Files:  raw.mp4 (original clip)  ref.<ext> (new person)  preview.mp4 / mask.mp4 / section.mp4 / proc/ (mask step)
         generated.mp4 (raw generation)  src.mp4 (swapped clip)  layer.npy, tracks.json, prepared.json (slider)  final.mp4 (result)
         face.<ext> (the photo face-lock sends to Magic Hour, chosen by picker.py)  src_plain.mp4 (the swap before face-lock, kept)
+        ref_collage.png (EXPERIMENTAL, only with request.collage: the one reference image Wan generates from)
+
+Collage (EXPERIMENTAL, off by default, not measured yet): with request.collage, ref_collage.png = the main photo + a
+head-and-shoulders crop of one added face photo side by side (collage.py), made at upload. request_of() hands it to the mask
+step as the reference (--refer_path, which becomes proc/src_ref.png for generate.py). Everything else (the slider check, the
+slider's skin grain, face-lock and its pick) keeps using the original main photo ref.<ext>. The close-up is the picker's
+winner, or the best ADDED photo when the main photo won, so the main photo never appears twice. Needs at least one face photo.
 
 Best-photo pick: POST /swap and POST /facelock/{job} take the multipart field `face` 1 to 5 times (png/jpg/webp, each at most
 MAX_PHOTO_BYTES, all together at most 12 MB). The main photo ref.<ext> is always one more candidate. picker.py scores them
@@ -74,10 +81,12 @@ def _num(v, name):
 
 def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", margin="normal", start=0.0, length=0.0,
                  skin=None, skin_ext="", detector=tt.detect_face, face=None, face_ext="", facelock=False, faces=None,
-                 face_detector=None):
+                 face_detector=None, collage=False):
     """Store the original clip and the new person's photo. Returns the job id; the mask step then runs on a small GPU.
     `faces` is a list of (bytes, ext) candidate photos for face-lock (`face`/`face_ext` is the one-photo form); the best of
-    them and the main photo is kept (picker.py). `facelock` asks for the face-lock pass after the swap."""
+    them and the main photo is kept (picker.py). `facelock` asks for the face-lock pass after the swap.
+    `collage` (EXPERIMENTAL, needs at least one face photo): Wan gets ref_collage.png (main photo + close-up, collage.py) as
+    its reference instead of the main photo; the slider, the face check and face-lock still use the main photo."""
     resolution = resolution or "480p"
     margin = margin or "normal"
     if resolution not in sk.RESOLUTIONS:
@@ -86,6 +95,8 @@ def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", marg
         raise JobError("Margin must be tight, normal or loose.")
     start, length = _num(start, "Start"), _num(length, "Length")
     uploads = face_uploads(faces, face, face_ext)
+    if collage and not uploads:
+        raise JobError("Collage needs a face close-up.", 422)
     job = tsvc.new_job(root, video, photo, photo_ext, consent, video_name="raw.mp4", skin=skin, skin_ext=skin_ext)
     d = tsvc.job_dir(root, job)
     try:
@@ -98,6 +109,8 @@ def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", marg
         request = {"resolution": resolution, "margin": margin, "start": s, "length": l}
         if facelock:                                  # only present when asked for, so a job without it is exactly as before
             request["facelock"] = True
+        if collage:                                   # same rule: only present when on
+            request["collage"] = True
         meta.update(kind="swap", request=request,
                     mask={"state": "queued"}, swap={"state": "idle"}, prepare={"state": "idle"},
                     facelock={"state": "idle"}, estimate=estimate(resolution, l))
@@ -105,11 +118,52 @@ def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", marg
             pick_face(d, meta, uploads, _picker_detector(detector, face_detector))
         elif facelock:
             _set_facelock_warning(d, meta, detector)
+        if collage:
+            make_collage_ref(d, meta, uploads, _picker_detector(detector, face_detector))
         tsvc.write_meta(d, meta)
     except Exception:
         shutil.rmtree(d, ignore_errors=True)
         raise
     return job
+
+
+COLLAGE_NAME = "ref_collage.png"
+
+
+def collage_face_index(pick, n_added):
+    """1-based number of the added photo the collage uses: the picker's winner when it is an added photo; when the main photo
+    won (or no photo had a face), the best ADDED photo by the picker's own order (face found, not a profile, score, face size,
+    earlier photo), so the main photo never appears twice in the collage."""
+    if pick["chosen"] <= n_added:
+        return pick["chosen"]
+    added = pick["scores"][:n_added]
+    return 1 + max(range(n_added), key=lambda i: (added[i]["face_px"] > 0, added[i]["front"] >= picker.PROFILE_FRONT,
+                                                  added[i]["score"], added[i]["face_px"], -i))
+
+
+def make_collage_ref(d, meta, uploads, face_detector):
+    """EXPERIMENTAL: write ref_collage.png (main photo + the chosen close-up) and record which close-up in meta["collage"].
+    Runs after pick_face, so meta["facelock"]["pick"] is there. The main photo ref.<ext> is not touched."""
+    import collage
+    n = collage_face_index(meta["facelock"]["pick"], len(uploads))
+    try:
+        png = collage.make_collage((d / meta["ref"]).read_bytes(), uploads[n - 1][0], detector=face_detector)
+    except ValueError as e:
+        raise JobError(f"The collage could not be made: {e}") from None
+    tmp = d / (COLLAGE_NAME + ".tmp")
+    tmp.write_bytes(png)
+    tmp.replace(d / COLLAGE_NAME)
+    meta["collage"] = {"file": COLLAGE_NAME, "face": n, "of": len(uploads)}
+
+
+def generation_ref(d, meta):
+    """The file name Wan's preprocessing reads as the reference (--refer_path -> proc/src_ref.png -> generate.py):
+    ref_collage.png when the job asked for the collage, else the main photo."""
+    if meta.get("request", {}).get("collage"):
+        if not (d / COLLAGE_NAME).exists():
+            raise JobError("The collage reference is missing. Start over.", 409)
+        return COLLAGE_NAME
+    return meta["ref"]
 
 
 FACELOCK_MIN_FACE_PX = 256          # below this Magic Hour has little to copy (its docs ask for >= 512 x 512 px for the face)
@@ -271,10 +325,11 @@ def retexture(root, job, skin=None, skin_ext=""):
 
 
 def request_of(root, job):
-    """What the mask step needs: file names and the options chosen at upload."""
+    """What the mask step needs: file names and the options chosen at upload. `ref` is the image Wan generates from (the
+    collage when asked for); `photo` is always the main photo."""
     d = tsvc.job_dir(root, job)
     meta = tsvc.read_meta(d)
-    return {"dir": d, "ref": meta["ref"], **meta["request"]}
+    return {"dir": d, "ref": generation_ref(d, meta), "photo": meta["ref"], **meta["request"]}
 
 
 def mask_ready(root, job, section, stats, head=None):
@@ -429,9 +484,12 @@ def status(root, job, now=None):
     facelock = dict(m.get("facelock") or {"state": "idle"})
     if m.get("facelock_warning"):
         facelock["warning"] = m["facelock_warning"]
-    return {"job": job, "mask": m.get("mask", {}), "swap": m.get("swap", {}), "prepare": m.get("prepare", {}),
-            "render": m.get("render", {}), "facelock": facelock, "request": m.get("request", {}), "estimate": m.get("estimate"),
-            "expires_at": m["created"] + tsvc.JOB_TTL_SECONDS}
+    out = {"job": job, "mask": m.get("mask", {}), "swap": m.get("swap", {}), "prepare": m.get("prepare", {}),
+           "render": m.get("render", {}), "facelock": facelock, "request": m.get("request", {}), "estimate": m.get("estimate"),
+           "expires_at": m["created"] + tsvc.JOB_TTL_SECONDS}
+    if m.get("collage"):                      # EXPERIMENTAL collage reference: which added photo it used
+        out["collage"] = {"face": m["collage"]["face"], "of": m["collage"]["of"]}
+    return out
 
 
 def swapped_path(root, job):
