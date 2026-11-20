@@ -38,7 +38,7 @@ check on the `X-Syok-Country` header the router sets (see docs/H3.md, "Territory
 - Licence notice: *This engine uses MiniMax H3 under the H3 Community License, which does not allow use in the US, the
   European Union, the United Kingdom or South Korea. It is not offered there.*
 - Blocked message: *MiniMax H3 is not available in your region. Its licence does not allow use in the US, the EU, the UK or
-  South Korea, and we could not confirm you are outside them. You can still use the standard engine.*
+  South Korea, and we could not confirm you are outside them.*
 
 The tick can be kept like the existing consent records: `h3_territory.make_territory_record(country, "yes")` gives a plain dict
 (bound to the exact wording by SHA-256, plus the IP country) that `consent.save` / `consent.load` store as JSON.

@@ -14,7 +14,7 @@ const NOT_A_COUNTRY = new Set(["XX", "T1", "ZZ", "EU", "AP"]);
 
 const BLOCKED_MESSAGE =
   "MiniMax H3 is not available in your region. Its licence does not allow use in the US, the EU, the UK or " +
-  "South Korea, and we could not confirm you are outside them. You can still use the standard engine.";
+  "South Korea, and we could not confirm you are outside them.";
 
 export function h3Blocked(country) {
   if (typeof country !== "string") return true;            // missing or unknown: blocked
