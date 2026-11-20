@@ -195,6 +195,9 @@ def _stage(job, stage, node_id, timeout_s, failure):
         missing = eng.models_missing(MODELS, stage)
         if missing:
             raise ValueError("Model files are missing on your Modal account: " + ", ".join(missing) + ". Run the fetch step.")
+        import swapkit
+        if eng.add_silent_audio(d / eng.VIDEO_NAME, swapkit.probe):   # jobs made before this fix may hold a silent clip
+            jobs.commit()
         graph = eng.graph_for(JOBS, job, stage)
         produced = _run_graph(eng, d, graph, node_id, timeout_s)
         eng.finish(JOBS, job, stage, produced)

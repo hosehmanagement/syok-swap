@@ -301,8 +301,8 @@ def test_plan_section():
 
 # ---------------------------------------------------------------- job folder / meta.json
 
-def fake_probe(seconds):
-    return lambda path: {"duration": seconds}
+def fake_probe(seconds, has_audio=True):
+    return lambda path: {"duration": seconds, "has_audio": has_audio}
 
 
 @pytest.fixture
@@ -503,3 +503,46 @@ def test_model_sources_are_the_verified_ones_and_never_guessed():
             h3.resolve_sources()
     finally:
         h3.MODEL_SOURCES = old
+
+
+# ---------------------------------------------------------------- silent source clips (first live run: VHS failed on a clip without audio)
+
+def test_audio_present_leaves_the_file_alone(tmp_path):
+    f = tmp_path / "v.mp4"
+    f.write_bytes(b"x")
+    calls = []
+    assert h3.add_silent_audio(f, lambda p: {"has_audio": True}, run=lambda *a, **k: calls.append(a)) is False
+    assert calls == [] and f.read_bytes() == b"x"
+
+
+def test_silent_clip_gets_a_real_audio_track(tmp_path):
+    import shutil
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not installed")
+    import swapkit
+    f = make_video(tmp_path / "silent.mp4", SKIN, n=12, fps=24, w=64, h=64)
+    assert swapkit.probe(f)["has_audio"] is False
+    assert h3.add_silent_audio(f, swapkit.probe) is True
+    after = swapkit.probe(f)
+    assert after["has_audio"] is True and (after["width"], after["height"]) == (64, 64)
+
+
+def test_new_job_adds_audio_to_a_silent_source(tmp_path, clip_bytes):
+    import shutil
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not installed")
+    import swapkit
+    root = tmp_path / "jobs"
+    root.mkdir()
+    long_clip = make_video(tmp_path / "long.mp4", SKIN, n=72, fps=24, w=64, h=64).read_bytes()   # 3 s: the engine needs >= 2 s
+    job = h3.new_h3_job(root, long_clip, photo_bytes(), ".png", "yes", swapkit.probe)
+    assert swapkit.probe(h3.tsvc.job_dir(root, job) / h3.VIDEO_NAME)["has_audio"] is True
+
+
+def test_failure_to_add_audio_is_a_clear_error_and_leaves_no_temp_file(tmp_path):
+    f = tmp_path / "v.mp4"
+    f.write_bytes(b"x")
+    class R: returncode = 1
+    with pytest.raises(JobError):
+        h3.add_silent_audio(f, lambda p: {"has_audio": False}, run=lambda *a, **k: R())
+    assert f.read_bytes() == b"x" and not list(tmp_path.glob("with_audio_*"))
