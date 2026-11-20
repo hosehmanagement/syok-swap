@@ -19,5 +19,9 @@ The endpoint refuses every request without your proxy token (`requires_proxy_aut
 2. You check the mask (`GET /mask/{job}`), then confirm. `POST /generate/{job}` runs the paid H100 swap (once per job).
 3. Face tracking starts automatically on the swapped clip. Then the slider works: `GET /preview/{job}?frame=N&strength=S` (one frame),
    `POST /render/{job}?strength=S` (full render), `GET /result/{job}`. `GET /swapped/{job}` is the plain swap without texture.
-4. `GET /status/{job}`, `DELETE /job/{job}`, `GET /health`, `POST /setup`.
+4. The realism slider takes its skin grain from the face in the photo; when the face shows too little plain skin (glasses,
+   or a tiny face in a full-body photo) it uses plain skin anywhere in the photo. `POST /swap` also takes an optional `skin`
+   close-up, and refuses (422, nothing charged) a photo that cannot feed the slider. `POST /retexture/{job}` (optional `skin`)
+   prepares the slider again on a finished swap, CPU only.
+5. `GET /status/{job}`, `DELETE /job/{job}`, `GET /health`, `POST /setup`.
 Limits: video up to 60 MB, photo up to 8 MB, section up to 30 s. Clothes come from the reference photo.

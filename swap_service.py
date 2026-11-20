@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 import swapkit as sk
+import texture_transfer as tt
 import texture_service as tsvc
 from texture_service import JobError
 
@@ -51,7 +52,8 @@ def _num(v, name):
     return n
 
 
-def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", margin="normal", start=0.0, length=0.0):
+def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", margin="normal", start=0.0, length=0.0,
+                 skin=None, skin_ext="", detector=tt.detect_face):
     """Store the original clip and the new person's photo. Returns the job id; the mask step then runs on a small GPU."""
     resolution = resolution or "480p"
     margin = margin or "normal"
@@ -60,7 +62,7 @@ def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", marg
     if margin not in sk.MARGINS:
         raise JobError("Margin must be tight, normal or loose.")
     start, length = _num(start, "Start"), _num(length, "Length")
-    job = tsvc.new_job(root, video, photo, photo_ext, consent, video_name="raw.mp4")
+    job = tsvc.new_job(root, video, photo, photo_ext, consent, video_name="raw.mp4", skin=skin, skin_ext=skin_ext)
     d = tsvc.job_dir(root, job)
     try:
         try:
@@ -68,6 +70,7 @@ def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", marg
         except ValueError as e:
             raise JobError(str(e))
         meta = tsvc.read_meta(d)
+        check_slider_photo(d, meta, detector)
         meta.update(kind="swap", request={"resolution": resolution, "margin": margin, "start": s, "length": l},
                     mask={"state": "queued"}, swap={"state": "idle"}, prepare={"state": "idle"},
                     estimate=estimate(resolution, l))
@@ -76,6 +79,38 @@ def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", marg
         shutil.rmtree(d, ignore_errors=True)
         raise
     return job
+
+
+def check_slider_photo(d, meta, detector=tt.detect_face):
+    """BEFORE anything is paid for: can the photo (or the skin close-up) feed the realism slider? Refuse if not."""
+    try:
+        width = tt.face_width_in(d / "raw.mp4", detector)
+    except Exception:
+        width = None
+    sp = tsvc.skin_path(d, meta)
+    try:
+        tt.check_reference(sp or (d / meta["ref"]), width, detector=detector, need_face=not sp)
+    except ValueError as e:
+        tip = ("" if sp else " You can also add a skin close-up of the same person (used only for skin grain).")
+        raise JobError(f"The realism slider cannot use this photo: {e}{tip} Nothing was started and nothing was charged.", 422)
+
+
+def retexture(root, job, skin=None, skin_ext=""):
+    """Run the slider preparation again on a finished swap (CPU only), optionally with a new skin close-up."""
+    d = tsvc.job_dir(root, job)
+    meta = tsvc.read_meta(d)
+    if meta.get("swap", {}).get("state") != "done" or not (d / "src.mp4").exists():
+        raise JobError("The swap is not finished.", 409)
+    if meta.get("prepare", {}).get("state") in ("queued", "preparing"):
+        raise JobError("The slider is already being prepared.", 409)
+    if meta.get("render", {}).get("state") in ("queued", "rendering"):
+        raise JobError("A render is running. Wait for it to finish.", 409)
+    if skin:
+        tsvc.set_skin(root, job, skin, skin_ext)
+    for name in ("layer.npy", "tracks.json", "prepared.json", "final.mp4"):
+        (d / name).unlink(missing_ok=True)
+    tsvc.set_stage(d, "render", state="idle")
+    tsvc.set_stage(d, "prepare", state="queued", message=None)
 
 
 def request_of(root, job):
