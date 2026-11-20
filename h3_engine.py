@@ -605,3 +605,26 @@ def resolve_sources(overrides=None):
         raise ValueError("No verified download source for: " + ", ".join(missing)
                          + ". Pass them with --sources (see docs/H3.md); they are not guessed.")
     return src
+
+
+FETCH_FLAG = ".h3-fetch-started"            # in the models Volume root while h3_app.fetch_models runs
+FETCH_STALE_SECONDS = 4 * 3600 + 300        # fetch_models' Modal timeout plus a margin: a flag older than this is a dead fetch
+
+
+def weights_state(models_dir, now=None, stale=FETCH_STALE_SECONDS):
+    """"ready" | "downloading" | "missing" for the H3 model files (the web API's /health and /setup).
+    ready = no file is missing for either stage (models_missing). downloading = files are missing but a fetch wrote its
+    start flag less than `stale` seconds ago. Anything else (no flag, unreadable flag, a fetch that died) is missing,
+    so /setup can start the fetch again; files already on the Volume are not downloaded twice."""
+    if not models_missing(models_dir, "swap") and not models_missing(models_dir, "check"):
+        return "ready"
+    flag = Path(models_dir) / FETCH_FLAG
+    if flag.is_file():
+        now = time.time() if now is None else now
+        try:
+            started = float(flag.read_text())
+        except (OSError, ValueError):
+            started = flag.stat().st_mtime
+        if 0 <= now - started < stale:
+            return "downloading"
+    return "missing"

@@ -1,7 +1,8 @@
-# MiniMax H3 territory safeguard (not wired in, not deployed)
+# MiniMax H3 territory safeguard (not deployed)
 
 The live engine is still **Wan2.2-Animate** (Apache-2.0). This page describes groundwork for a possible **MiniMax H3** engine.
-Nothing here is deployed, and `app.py` / `swap_api.py` do not use it yet.
+Nothing here is deployed. `app.py` / `swap_api.py` (Wan) do not use it; the H3 web API (`h3_api.py`) does, on the
+`X-Syok-Country` header the router sets (see docs/H3.md, "Territory: the router adds the header").
 
 ## Important: this is NOT legal compliance
 
