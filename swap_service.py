@@ -1,23 +1,34 @@
 """Syok Swap as ONE job, from the first upload to the saved clip. No Modal, no GPU here, so every rule is unit-testable.
 
-A job is a folder under a root directory (on Modal: the `syok-swap-cache` Volume, under jobs/). One meta.json carries four stages:
+A job is a folder under a root directory (on Modal: the `syok-swap-cache` Volume, under jobs/). One meta.json carries five stages:
 
     mask     "queued" -> "preparing" -> "ready" | "error"   small GPU, cents: finds the person, red-overlay preview (preview.mp4)
     swap     "idle" -> "queued" -> "generating" -> "done" | "error"   H100, the paid step: the new person is generated
-    prepare  "idle" -> "queued" -> "preparing" -> "ready" | "error"   CPU, starts by itself when the swap is done:
+    facelock "idle" -> "waiting" -> "queued" -> "working" -> "done" | "error" | "skipped"   OPTIONAL, CPU + the user's own
+                                                           Magic Hour account: puts the exact face from the photo onto the
+                                                           swapped clip (facelock.py). Only when the user ticked the box.
+    prepare  "idle" -> "queued" -> "preparing" -> "ready" | "error"   CPU, starts by itself when the swap is done (or when the
+                                                           face-lock is done, failed or skipped):
                                                            tracks the face in the SWAPPED clip for the texture slider
     render   "idle" -> "queued" -> "rendering" -> "done" | "error"   CPU: the full clip at the slider's strength (final.mp4)
 
 The texture slider is not a separate tool: the swapped clip becomes src.mp4 in this same folder and the same reference photo
 (ref.<ext>) that drove the swap gives the skin grain, so the user never uploads anything twice.
 
+Face-lock: with request.facelock the swap ends in facelock "waiting" and the slider is NOT prepared yet (the clip will change).
+POST /facelock/{job} (with the user's Magic Hour key in a header, never stored) runs it; POST /facelock/{job}/skip uses the swap
+as it is. Either way the slider is then prepared on whatever src.mp4 is.
+
 Files:  raw.mp4 (original clip)  ref.<ext> (new person)  preview.mp4 / mask.mp4 / section.mp4 / proc/ (mask step)
         generated.mp4 (raw generation)  src.mp4 (swapped clip)  layer.npy, tracks.json, prepared.json (slider)  final.mp4 (result)
+        face.<ext> (optional face close-up for face-lock)  src_plain.mp4 (the swap before face-lock, kept)
 """
 import os
 import shutil
 import time
 from pathlib import Path
+
+import cv2
 
 import swapkit as sk
 import texture_transfer as tt
@@ -53,8 +64,9 @@ def _num(v, name):
 
 
 def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", margin="normal", start=0.0, length=0.0,
-                 skin=None, skin_ext="", detector=tt.detect_face):
-    """Store the original clip and the new person's photo. Returns the job id; the mask step then runs on a small GPU."""
+                 skin=None, skin_ext="", detector=tt.detect_face, face=None, face_ext="", facelock=False):
+    """Store the original clip and the new person's photo. Returns the job id; the mask step then runs on a small GPU.
+    `face` is an optional close-up for face-lock, `facelock` asks for the face-lock pass after the swap."""
     resolution = resolution or "480p"
     margin = margin or "normal"
     if resolution not in sk.RESOLUTIONS:
@@ -62,6 +74,7 @@ def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", marg
     if margin not in sk.MARGINS:
         raise JobError("Margin must be tight, normal or loose.")
     start, length = _num(start, "Start"), _num(length, "Length")
+    fext = _face_ext(face, face_ext)
     job = tsvc.new_job(root, video, photo, photo_ext, consent, video_name="raw.mp4", skin=skin, skin_ext=skin_ext)
     d = tsvc.job_dir(root, job)
     try:
@@ -71,14 +84,66 @@ def new_swap_job(root, video, photo, photo_ext, consent, resolution="480p", marg
             raise JobError(str(e))
         meta = tsvc.read_meta(d)
         check_slider_photo(d, meta, detector)
-        meta.update(kind="swap", request={"resolution": resolution, "margin": margin, "start": s, "length": l},
+        request = {"resolution": resolution, "margin": margin, "start": s, "length": l}
+        if facelock:                                  # only present when asked for, so a job without it is exactly as before
+            request["facelock"] = True
+        meta.update(kind="swap", request=request,
                     mask={"state": "queued"}, swap={"state": "idle"}, prepare={"state": "idle"},
-                    estimate=estimate(resolution, l))
+                    facelock={"state": "idle"}, estimate=estimate(resolution, l))
+        if face:
+            (d / f"face{fext}").write_bytes(face)
+            meta["face"] = f"face{fext}"
+        if face or facelock:
+            _set_facelock_warning(d, meta, detector)
         tsvc.write_meta(d, meta)
     except Exception:
         shutil.rmtree(d, ignore_errors=True)
         raise
     return job
+
+
+FACELOCK_MIN_FACE_PX = 256          # below this Magic Hour has little to copy (its docs ask for >= 512 x 512 px for the face)
+
+
+def _face_ext(face, face_ext):
+    """The optional face close-up for face-lock: png/jpg/webp, at most MAX_PHOTO_BYTES."""
+    if not face:
+        return ""
+    ext = (face_ext or "").lower()
+    if ext not in tsvc.PHOTO_EXTS:
+        raise JobError("Face photo must be png, jpg or webp.")
+    if len(face) > tsvc.MAX_PHOTO_BYTES:
+        raise JobError(f"Face photo is larger than {tsvc.MAX_PHOTO_BYTES // 2**20} MB.")
+    return ext
+
+
+def facelock_warning(photo_path, detector=tt.detect_face):
+    """A plain-English warning when the face Magic Hour would copy is small (or not found), else None. Never blocks."""
+    img = cv2.imread(str(photo_path))
+    if img is None:
+        return "We could not read the face photo, so Magic Hour may not either. Add a sharp head-and-shoulders close-up."
+    try:
+        box, _ = detector(img)
+    except Exception:
+        box = None
+    if box is None:
+        return ("We could not find a clear face in your photo, so Magic Hour may not either. "
+                "Add a sharp head-and-shoulders close-up for a closer likeness.")
+    width = int(round(float(box[2])))
+    if width >= FACELOCK_MIN_FACE_PX:
+        return None
+    return (f"The face in your photo is only about {width} px wide, so Magic Hour has little to copy. Add a sharp "
+            "head-and-shoulders close-up for a closer likeness. Magic Hour asks for a face area of at least 512 x 512 px.")
+
+
+def _set_facelock_warning(d, meta, detector):
+    w = facelock_warning(d / (meta.get("face") or meta["ref"]), detector)
+    if w:
+        meta["facelock_warning"] = w
+        meta.setdefault("facelock", {})["warning"] = w
+    else:
+        meta.pop("facelock_warning", None)
+        meta.setdefault("facelock", {}).pop("warning", None)
 
 
 def check_slider_photo(d, meta, detector=tt.detect_face):
@@ -105,6 +170,8 @@ def retexture(root, job, skin=None, skin_ext=""):
         raise JobError("The slider is already being prepared.", 409)
     if meta.get("render", {}).get("state") in ("queued", "rendering"):
         raise JobError("A render is running. Wait for it to finish.", 409)
+    if meta.get("facelock", {}).get("state") in ("queued", "working"):
+        raise JobError("Face-lock is running. Wait for it to finish.", 409)
     if skin:
         tsvc.set_skin(root, job, skin, skin_ext)
     for name in ("layer.npy", "tracks.json", "prepared.json", "final.mp4"):
@@ -157,25 +224,87 @@ def start_generate(root, job, relight=True):
 
 
 def finish_swap(root, job, final_path, had_audio):
-    """The GPU step made `final_path`: it becomes src.mp4, the clip the slider works on, and the slider's face tracking is queued."""
+    """The GPU step made `final_path`: it becomes src.mp4, the clip the slider works on, and the slider's face tracking is queued.
+    With face-lock asked for, face-lock waits for the user's Magic Hour key instead and the slider is NOT queued (the clip will
+    change). Returns True when the caller must spawn the slider preparation."""
     d = tsvc.job_dir(root, job)
     tmp = d / "src.mp4.tmp"
     shutil.copyfile(final_path, tmp)
     tmp.replace(d / "src.mp4")
     tsvc.set_stage(d, "swap", state="done", had_audio=bool(had_audio), bytes=(d / "src.mp4").stat().st_size, finished=time.time())
+    if tsvc.read_meta(d).get("request", {}).get("facelock"):
+        tsvc.set_stage(d, "facelock", state="waiting")
+        return False
     tsvc.set_stage(d, "prepare", state="queued")
+    return True
+
+
+FACELOCK_KEY_MIN = 8
+
+
+def start_facelock(root, job, key, face=None, face_ext="", detector=tt.detect_face):
+    """Check face-lock may start now and queue it. The key is only checked here, never stored: the caller passes it straight to
+    the spawned function. Optional `face` stores or replaces the face close-up first."""
+    if not isinstance(key, str) or len(key.strip()) < FACELOCK_KEY_MIN:
+        raise JobError("Connect your Magic Hour key first.", 400)
+    d = tsvc.job_dir(root, job)
+    meta = tsvc.read_meta(d)
+    if meta.get("swap", {}).get("state") != "done" or not (d / "src.mp4").exists():
+        raise JobError("The swap is not finished.", 409)
+    state = meta.get("facelock", {}).get("state", "idle")
+    if state not in ("idle", "waiting", "error", "skipped"):
+        raise JobError("Face-lock is already running or done for this clip." if state != "done"
+                       else "Face-lock is already done for this clip.", 409)
+    if meta.get("prepare", {}).get("state") in ("queued", "preparing"):
+        raise JobError("The slider is being prepared. Wait for it to finish, then lock the face.", 409)
+    if meta.get("render", {}).get("state") in ("queued", "rendering"):
+        raise JobError("A render is running. Wait for it to finish.", 409)
+    if face:
+        ext = _face_ext(face, face_ext)
+        if meta.get("face"):
+            (d / meta["face"]).unlink(missing_ok=True)
+        (d / f"face{ext}").write_bytes(face)
+        meta["face"] = f"face{ext}"
+        _set_facelock_warning(d, meta, detector)
+        tsvc.write_meta(d, meta)
+    tsvc.set_stage(d, "facelock", state="queued", message=None, note=None, credits=None, started=time.time())
+
+
+def skip_facelock(root, job):
+    """Use the swap as it is: only while face-lock waits for the key or after it failed. Returns True when the caller must
+    spawn the slider preparation (not when the slider is already ready or on its way, e.g. queued by the failed face-lock)."""
+    d = tsvc.job_dir(root, job)
+    meta = tsvc.read_meta(d)
+    state = meta.get("facelock", {}).get("state", "idle")
+    if state not in ("waiting", "error"):
+        raise JobError("A finished face-lock cannot be skipped." if state == "done"
+                       else "Face-lock can only be skipped while it waits or after it failed.", 409)
+    tsvc.set_stage(d, "facelock", state="skipped", message=None)
+    if meta.get("prepare", {}).get("state") in ("ready", "queued", "preparing"):
+        return False
+    tsvc.set_stage(d, "prepare", state="queued", message=None)
+    return True
+
+
+def facelock_blocks_render(root, job):
+    """A render must not start while face-lock may replace the clip under it."""
+    if tsvc.read_meta(tsvc.job_dir(root, job)).get("facelock", {}).get("state") in ("queued", "working"):
+        raise JobError("Face-lock is running. Wait for it to finish.", 409)
 
 
 # A step that is "running" for longer than its Modal time limit (plus a margin) died without writing an answer (out of credits,
 # a restart, a time-out). Say so instead of leaving the card spinning for ever.
 ACTIVE = {"mask": ("queued", "preparing"), "swap": ("queued", "generating"), "prepare": ("queued", "preparing"),
-          "render": ("queued", "rendering")}
-STUCK_AFTER_SECONDS = {"mask": 3600 + 300, "swap": 10800 + 300, "prepare": 1800 + 300, "render": 3600 + 300}
+          "render": ("queued", "rendering"), "facelock": ("queued", "working")}
+STUCK_AFTER_SECONDS = {"mask": 3600 + 300, "swap": 10800 + 300, "prepare": 1800 + 300, "render": 3600 + 300,
+                       "facelock": 1800 + 300}
 STUCK_MESSAGE = {
     "mask": "The mask step stopped without finishing (Modal's time limit, a restart, or no credit left). Start over.",
     "swap": "The swap stopped without finishing (Modal's time limit, a restart, or no credit left). Check your Modal dashboard, then try again.",
     "prepare": "Preparing the texture slider stopped without finishing. Try again.",
-    "render": "The render stopped without finishing. Try again."}
+    "render": "The render stopped without finishing. Try again.",
+    "facelock": "Face-lock stopped without finishing (Modal's time limit or a restart). Check your Magic Hour dashboard, "
+                "then try again or skip it to use the swap as it is."}
 
 
 def _expire_stuck(d, meta, now):
@@ -210,8 +339,11 @@ def weights_state(weights_dir, flag_dir, min_bytes=40 * 10**9, now=None, stale=3
 def status(root, job, now=None):
     d = tsvc.job_dir(root, job)
     m = _expire_stuck(d, tsvc.read_meta(d), time.time() if now is None else now)
+    facelock = dict(m.get("facelock") or {"state": "idle"})
+    if m.get("facelock_warning"):
+        facelock["warning"] = m["facelock_warning"]
     return {"job": job, "mask": m.get("mask", {}), "swap": m.get("swap", {}), "prepare": m.get("prepare", {}),
-            "render": m.get("render", {}), "request": m.get("request", {}), "estimate": m.get("estimate"),
+            "render": m.get("render", {}), "facelock": facelock, "request": m.get("request", {}), "estimate": m.get("estimate"),
             "expires_at": m["created"] + tsvc.JOB_TTL_SECONDS}
 
 
