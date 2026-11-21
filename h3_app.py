@@ -85,6 +85,8 @@ GPU_CHECK = os.environ.get("SYOK_H3_CHECK_GPU", "L4")
 # Fix faces loads the same H3 model, 32B text encoder and VAEs as the swap, on 512x512 face crops (smaller than any swap
 # canvas), so the swap's GPU is the one known to fit (the live 480p swap ran on it). Not measured on Modal yet.
 GPU_FACES = os.environ.get("SYOK_H3_FACES_GPU", GPU_SWAP)
+# A GPU machine stays on (and billed) this many seconds after its job ends, then switches off. Pinned here so a Modal default change cannot lengthen it.
+GPU_IDLE_SECONDS = int(os.environ.get("SYOK_H3_GPU_IDLE_SECONDS", "60"))
 SWAP_MINUTES = int(os.environ.get("SYOK_H3_SWAP_MINUTES", "240"))   # hard cap on the paid GPU step (the first live test sets 45)
 FACES_MINUTES = int(os.environ.get("SYOK_H3_FACES_MINUTES", "120"))  # openjutsu: 17 s at 768p took ~28 min on a 4060 Ti
 REGION = [r.strip() for r in os.environ.get("SYOK_H3_REGION", "").split(",") if r.strip()] or None
@@ -245,7 +247,7 @@ def _stage(job, stage, node_id, timeout_s, failure):
 
 
 @app.function(image=image, gpu=GPU_CHECK, region=REGION, memory=32768, volumes={MODELS: models, JOBS: jobs},
-              timeout=3600, max_containers=2)
+              timeout=3600, max_containers=2, scaledown_window=GPU_IDLE_SECONDS)
 def check_job(job: str):
     """The mask check: SAM 3.1 + the edit mask over the section, cyan/orange preview next to the grey mannequin."""
     eng = _eng()
@@ -254,7 +256,7 @@ def check_job(job: str):
 
 
 @app.function(image=image, gpu=GPU_SWAP, region=REGION, memory=65536, volumes={MODELS: models, JOBS: jobs},
-              timeout=SWAP_MINUTES * 60, max_containers=1)
+              timeout=SWAP_MINUTES * 60, max_containers=1, scaledown_window=GPU_IDLE_SECONDS)
 def swap_job(job: str):
     """The paid step. Run it again on the same job after an error: the Context Loop resumes from the last finished clip."""
     eng = _eng()
@@ -263,7 +265,7 @@ def swap_job(job: str):
 
 
 @app.function(image=image, gpu=GPU_FACES, region=REGION, memory=65536, volumes={MODELS: models, JOBS: jobs},
-              timeout=FACES_MINUTES * 60, max_containers=1)
+              timeout=FACES_MINUTES * 60, max_containers=1, scaledown_window=GPU_IDLE_SECONDS)
 def faces_job(job: str):
     """Optional paid step, only when the user asks (POST /fixfaces): openjutsu Fix faces on the finished swap (h3.mp4) with
     the same photo. Starting it again after an error runs it again from the start (no checkpoints)."""
