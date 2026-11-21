@@ -8,9 +8,10 @@ Territory (H3 Community License excludes the US, the EU, the UK and South Korea;
     which only the router holds. A form field of the same or a similar name is never read. The value goes through
     h3_territory.check_country and FAILS CLOSED: a missing, empty, malformed, "XX" (unknown) or "T1" (Tor) value, or a
     blocked country, is refused with 451 {"error": "territory", ...}.
-    Checked on: POST /swap (header AND the tick box territory=yes), POST /generate/{job} (the paid H3 run) and POST /setup
-    (downloads the H3 model files). Not checked on /health, /status, /mask, /result and DELETE /job, so a user can always
-    read and delete their own job (the router checks the country on every route anyway).
+    Checked on: POST /swap (header AND the tick box territory=yes), POST /generate/{job} (the paid H3 run), POST
+    /fixfaces/{job} (the optional paid H3 face run) and POST /setup (downloads the H3 model files). Not checked on /health,
+    /status, /mask, /result, /faces and DELETE /job, so a user can always read and delete their own job (the router checks
+    the country on every route anyway).
 
 Routes:
     GET    /health          -> {"ok", "app": "syok-swap-h3", "version", "engine", "weights", "label", "territory",
@@ -22,8 +23,15 @@ Routes:
     GET    /mask/{job}      -> check.mp4 (video/mp4) once the mask check is ready (409 before)
     POST   /generate/{job}  the PAID step (big GPU) -> {"state": "queued", "resume": bool}
     GET    /result/{job}    -> h3.mp4 (video/mp4), 409 until done
-    DELETE /job/{job}       -> {"deleted": true}
+    POST   /fixfaces/{job}  json {"mode": "photo" | "mouth"} (default "photo"): the optional PAID Fix faces run on the
+                            finished swap (big GPU) -> {"state": "queued"}. Opt-in only: never started by anything else.
+    GET    /faces/{job}     -> faces.mp4 (video/mp4), 409 until done
+    DELETE /job/{job}       -> {"deleted": true} (the swap and the Fix faces result go with the job)
+
+Fix faces licence note (shown to the user by the web card too): it uses the InsightFace buffalo_l face model, licensed for
+non-commercial research only, and Ultralytics YOLO weights (AGPL-3.0). That is why it is opt-in and never automatic.
 """
+import json
 from pathlib import Path
 
 import h3_engine as h3
@@ -39,6 +47,9 @@ TERRITORY_ERROR = "MiniMax H3 is not available where you are (US, EU, UK, South 
 CONSENT_ERROR = ("Only use photos and videos of people who agreed to it (or fictional characters). Tick the consent box "
                  "(consent=yes).")
 TICK_ERROR = "Tick '" + terr.TERRITORY_CONSENT_TEXT + "' to use " + terr.ENGINE_LABEL + "."
+FACES_DOWNLOADING = ("The Fix faces model files (about 0.5 GB) are downloading to your Modal account. Try again in a few "
+                     "minutes.")
+FACES_UNAVAILABLE = "Fix faces is not set up on this engine."
 
 # What one live run measured (contract / docs/H3.md): the mask check took about 17 minutes on a cold L4, and a 6 s clip at
 # 480p swapped in about 3 minutes on an L40S. Only that one data point exists, so other resolutions get no swap time.
@@ -72,10 +83,12 @@ def estimate(request, clips):
 
 
 def build_h3_app(root, spawn_check, spawn_swap, spawn_weights, weights_state, before_read=lambda: None,
-                 after_write=lambda: None, probe=None):
-    """`spawn_check(job)` / `spawn_swap(job)` start the GPU steps, `spawn_weights()` starts the model download,
-    `weights_state()` -> "ready" | "downloading" | "missing". `probe(path)` reads the video (swapkit.probe by default)."""
-    from fastapi import FastAPI, File, Form, Header, UploadFile
+                 after_write=lambda: None, probe=None, spawn_faces=None, faces_weights_state=None):
+    """`spawn_check(job)` / `spawn_swap(job)` / `spawn_faces(job)` start the GPU steps, `spawn_weights()` starts the model
+    download (it fetches every missing file, the Fix faces ones included), `weights_state()` and `faces_weights_state()`
+    -> "ready" | "downloading" | "missing" (swap + check files / Fix faces files). `probe(path)` reads the video
+    (swapkit.probe by default). Without `spawn_faces` the Fix faces routes answer 501."""
+    from fastapi import FastAPI, File, Form, Header, Request, UploadFile
     from fastapi.responses import FileResponse, JSONResponse
 
     if probe is None:
@@ -171,6 +184,41 @@ def build_h3_app(root, spawn_check, spawn_swap, spawn_weights, weights_state, be
     def result(job: str):
         before_read()
         return FileResponse(h3.result_path(root, job, "swap"), media_type="video/mp4", filename=f"syok-h3-{job}.mp4")
+
+    @app.post("/fixfaces/{job}")
+    async def fixfaces(job: str, request: Request, x_syok_country: str = Header(None)):
+        # Licence gate first: the body is not even read for a refused country.
+        territory_gate(x_syok_country)
+        if spawn_faces is None or faces_weights_state is None:
+            raise tsvc.JobError(FACES_UNAVAILABLE, 501)
+        raw = await request.body()
+        try:
+            body = json.loads(raw) if raw.strip() else {}
+        except ValueError:
+            raise tsvc.JobError("Send JSON like {\"mode\": \"photo\"}.") from None
+        if not isinstance(body, dict):
+            raise tsvc.JobError("Send JSON like {\"mode\": \"photo\"}.")
+        before_read()
+        _, mode, _ = h3.check_faces_start(root, job, body.get("mode"))     # 404 / 409 / 400, nothing written yet
+        state = faces_weights_state()
+        if state != "ready":
+            if state == "missing":
+                spawn_weights()
+            raise tsvc.JobError(FACES_DOWNLOADING, 409)
+        h3.start_faces(root, job, mode)
+        after_write()
+        try:
+            spawn_faces(job)
+        except Exception:
+            h3.fail(root, job, "faces", "Fix faces could not start. Try again: nothing was generated.")
+            after_write()
+            raise tsvc.JobError("Fix faces could not start on your Modal account. Try again.", 500) from None
+        return {"state": "queued"}
+
+    @app.get("/faces/{job}")
+    def faces(job: str):
+        before_read()
+        return FileResponse(h3.result_path(root, job, "faces"), media_type="video/mp4", filename=f"syok-h3-faces-{job}.mp4")
 
     @app.delete("/job/{job}")
     def delete(job: str):

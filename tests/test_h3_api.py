@@ -31,7 +31,8 @@ TERRITORY_JSON = {"error": "territory", "message": "MiniMax H3 is not available 
 class Rig:
     """Wires the API to fake GPU steps. `calls` counts how often each GPU / download step was started."""
 
-    def __init__(self, tmp_path, weights="ready", check_ok=True, seconds=8.0, check_runs=True):
+    def __init__(self, tmp_path, weights="ready", check_ok=True, seconds=8.0, check_runs=True, faces_weights="ready",
+                 faces_ok=True, faces_runs=True):
         self.root = tmp_path / "jobs"
         self.root.mkdir()
         self.tmp = tmp_path
@@ -41,9 +42,12 @@ class Rig:
         self.calls = {"check": 0, "swap": 0, "weights": 0}
         self.events = []
         self.seconds = seconds
+        self.faces_weights, self.faces_ok, self.faces_runs = faces_weights, faces_ok, faces_runs
+        self.faces_calls = 0
         app = h3_api.build_h3_app(self.root, self.check, self.swap, self.fetch, lambda: self.weights,
                                   before_read=lambda: self.events.append("r"), after_write=lambda: self.events.append("w"),
-                                  probe=lambda p: {"duration": self.seconds, "has_audio": True})
+                                  probe=lambda p: {"duration": self.seconds, "has_audio": True},
+                                  spawn_faces=self.faces, faces_weights_state=lambda: self.faces_weights)
         self.c = TestClient(app)
 
     def _clip(self, name):
@@ -66,6 +70,21 @@ class Rig:
 
     def fetch(self):
         self.calls["weights"] += 1
+
+    def faces(self, job):                                   # what faces_job does on the big GPU (optional, paid)
+        self.faces_calls += 1
+        if not self.faces_runs:
+            return
+        h3.begin(self.root, job, "faces")
+        if self.faces_ok:
+            h3.finish(self.root, job, "faces", make_video(self.tmp / "faces_out.mp4", SKIN, n=12, fps=24, w=64, h=64))
+        else:
+            h3.fail(self.root, job, "faces", "Fix faces failed. Try again: it runs again from the start.")
+
+    def swapped(self):
+        job = self.upload().json()["job"]
+        assert self.c.post(f"/generate/{job}", headers=OK).status_code == 200
+        return job
 
     def upload(self, data=None, headers=OK, files=None, **extra):
         files = files or {"video": ("v.mp4", self._clip("src.mp4").read_bytes(), "video/mp4"),
@@ -459,3 +478,207 @@ def test_no_secret_or_country_is_ever_logged_or_put_in_meta_beyond_the_code(tmp_
     raw = (svc.job_dir(r.root, job) / "meta.json").read_text()
     assert "not-a-real-token" not in raw and "Bearer" not in raw
     assert json.loads(raw)["country"] == "MY"
+
+
+# ---------------------------------------------------------------- Fix faces: POST /fixfaces, GET /faces (optional, paid)
+
+def test_fix_faces_flow_through_the_http_layer(tmp_path):
+    r = Rig(tmp_path)
+    job = r.swapped()
+    st = r.c.get(f"/status/{job}").json()
+    assert st["faces"] == {"state": "idle", "attempts": 0} and "faces_minutes" not in st["estimate"]
+    assert r.c.get(f"/faces/{job}").status_code == 409
+    f = r.c.post(f"/fixfaces/{job}", json={"mode": "mouth"}, headers=OK)
+    assert f.status_code == 200 and f.json() == {"state": "queued"}
+    st = r.c.get(f"/status/{job}").json()
+    assert st["faces"]["state"] == "done" and st["faces"]["mode"] == "mouth" and st["faces"]["attempts"] == 1
+    v = r.c.get(f"/faces/{job}")
+    assert v.status_code == 200 and v.headers["content-type"] == "video/mp4" and len(v.content) > 500
+    assert f"syok-h3-faces-{job}.mp4" in v.headers["content-disposition"]
+    assert r.c.get(f"/result/{job}").status_code == 200                                 # the original is still there
+    assert r.faces_calls == 1 and r.calls["swap"] == 1
+    again = r.c.post(f"/fixfaces/{job}", json={"mode": "photo"}, headers=OK)
+    assert again.status_code == 409 and "already fixed" in again.json()["error"] and r.faces_calls == 1
+    assert r.c.delete(f"/job/{job}").json() == {"deleted": True}
+    assert r.c.get(f"/faces/{job}").status_code == 404 and r.jobs() == []
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"content": b""}, {"json": {}}, {"json": {"mode": None}}, {"json": {"mode": ""}}])
+def test_fix_faces_defaults_to_match_the_photo(tmp_path, kwargs):
+    r = Rig(tmp_path)
+    job = r.swapped()
+    f = r.c.post(f"/fixfaces/{job}", headers=OK, **kwargs)
+    assert f.status_code == 200, f.text
+    assert r.c.get(f"/status/{job}").json()["faces"]["mode"] == "photo"
+
+
+@pytest.mark.parametrize("kwargs", [{"json": {"mode": "both"}}, {"json": {"mode": "PHOTO"}}, {"json": {"mode": 1}},
+                                    {"json": ["photo"]}, {"content": b"{not json"}])
+def test_fix_faces_bad_body_is_400_and_nothing_starts(tmp_path, kwargs):
+    r = Rig(tmp_path)
+    job = r.swapped()
+    f = r.c.post(f"/fixfaces/{job}", headers=OK, **kwargs)
+    assert f.status_code == 400 and r.faces_calls == 0
+    assert r.c.get(f"/status/{job}").json()["faces"]["state"] == "idle"
+
+
+def test_fix_faces_needs_the_finished_swap(tmp_path):
+    r = Rig(tmp_path)
+    job = r.upload().json()["job"]                                                   # mask checked, swap not run
+    f = r.c.post(f"/fixfaces/{job}", json={"mode": "photo"}, headers=OK)
+    assert f.status_code == 409 and "finished swap" in f.json()["error"] and r.faces_calls == 0
+    h3.start_swap(r.root, job)                                                       # swap queued, not done
+    assert r.c.post(f"/fixfaces/{job}", json={}, headers=OK).status_code == 409 and r.faces_calls == 0
+
+
+def test_fix_faces_while_queued_or_running_is_refused(tmp_path):
+    r = Rig(tmp_path, faces_runs=False)                                              # the GPU has not picked it up yet
+    job = r.swapped()
+    assert r.c.post(f"/fixfaces/{job}", json={}, headers=OK).status_code == 200
+    again = r.c.post(f"/fixfaces/{job}", json={}, headers=OK)
+    assert again.status_code == 409 and "already running" in again.json()["error"] and r.faces_calls == 1
+    h3.begin(r.root, job, "faces")
+    assert r.c.post(f"/fixfaces/{job}", json={}, headers=OK).status_code == 409 and r.faces_calls == 1
+    assert r.c.get(f"/faces/{job}").status_code == 409
+
+
+def test_a_failed_fix_faces_can_be_started_again(tmp_path):
+    r = Rig(tmp_path, faces_ok=False)
+    job = r.swapped()
+    assert r.c.post(f"/fixfaces/{job}", json={"mode": "photo"}, headers=OK).status_code == 200
+    st = r.c.get(f"/status/{job}").json()["faces"]
+    assert st["state"] == "error" and "from the start" in st["message"]
+    assert r.c.get(f"/faces/{job}").status_code == 409
+    r.faces_ok = True
+    f = r.c.post(f"/fixfaces/{job}", json={"mode": "mouth"}, headers=OK)
+    assert f.status_code == 200 and f.json() == {"state": "queued"}
+    st = r.c.get(f"/status/{job}").json()["faces"]
+    assert (st["state"], st["attempts"], st["resume"], st["mode"]) == ("done", 2, True, "mouth")
+    assert r.faces_calls == 2
+
+
+def test_fix_faces_that_cannot_start_is_marked_failed_and_can_be_started_again(tmp_path):
+    r = Rig(tmp_path)
+    job = r.swapped()
+
+    def boom(j):
+        raise RuntimeError("modal down")
+    c = TestClient(h3_api.build_h3_app(r.root, r.check, r.swap, r.fetch, lambda: "ready", spawn_faces=boom,
+                                       faces_weights_state=lambda: "ready"))
+    f = c.post(f"/fixfaces/{job}", json={"mode": "photo"}, headers=OK)
+    assert f.status_code == 500 and "modal down" not in f.text and "could not start" in f.json()["error"]
+    st = h3.status(r.root, job)["faces"]
+    assert st["state"] == "error" and st["attempts"] == 1
+    assert r.c.post(f"/fixfaces/{job}", json={}, headers=OK).status_code == 200            # resume after the error
+    assert h3.status(r.root, job)["faces"]["state"] == "done" and h3.status(r.root, job)["faces"]["attempts"] == 2
+
+
+@pytest.mark.parametrize("headers", [{}, {"X-Syok-Country": ""}, {"X-Syok-Country": "US"}, {"X-Syok-Country": "DE"},
+                                     {"X-Syok-Country": "GB"}, {"X-Syok-Country": "KR"}, {"X-Syok-Country": "XX"},
+                                     {"X-Syok-Country": "T1"}, {"X-Syok-Country": "MYS"}])
+def test_fix_faces_is_refused_outside_the_licensed_territory(tmp_path, headers):
+    r = Rig(tmp_path, faces_weights="missing")
+    job = r.swapped()
+    f = r.c.post(f"/fixfaces/{job}", json={"mode": "photo"}, headers=headers)
+    assert f.status_code == 451 and f.json() == TERRITORY_JSON
+    assert r.faces_calls == 0 and r.calls["weights"] == 0
+    assert r.c.get(f"/status/{job}").json()["faces"]["state"] == "idle"
+
+
+def test_fix_faces_territory_comes_before_the_body_and_the_job(tmp_path):
+    r = Rig(tmp_path)
+    for path in ("/fixfaces/0123456789abcdef", "/fixfaces/nothex"):
+        assert r.c.post(path, content=b"{not json", headers={"X-Syok-Country": "US"}).status_code == 451
+
+
+def test_fix_faces_country_is_not_taken_from_the_body_or_query(tmp_path):
+    r = Rig(tmp_path)
+    job = r.swapped()
+    f = r.c.post(f"/fixfaces/{job}?x_syok_country=MY", json={"mode": "photo", "X-Syok-Country": "MY", "country": "MY"})
+    assert f.status_code == 451 and r.faces_calls == 0
+
+
+def test_fix_faces_starts_the_face_model_download_when_files_are_missing(tmp_path):
+    r = Rig(tmp_path, faces_weights="missing")
+    job = r.swapped()
+    f = r.c.post(f"/fixfaces/{job}", json={}, headers=OK)
+    assert f.status_code == 409 and "downloading" in f.json()["error"]
+    assert r.calls["weights"] == 1 and r.faces_calls == 0
+    assert r.c.get(f"/status/{job}").json()["faces"]["state"] == "idle"              # nothing queued, nothing billed
+    r.faces_weights = "downloading"
+    assert r.c.post(f"/fixfaces/{job}", json={}, headers=OK).status_code == 409 and r.calls["weights"] == 1
+    r.faces_weights = "ready"
+    assert r.c.post(f"/fixfaces/{job}", json={}, headers=OK).status_code == 200 and r.faces_calls == 1
+
+
+def test_fix_faces_checks_the_job_before_the_model_files(tmp_path):
+    r = Rig(tmp_path, faces_weights="missing")
+    job = r.upload().json()["job"]                                                   # swap not done
+    assert r.c.post(f"/fixfaces/{job}", json={}, headers=OK).status_code == 409 and r.calls["weights"] == 0
+    assert r.c.post("/fixfaces/0123456789abcdef", json={}, headers=OK).status_code == 404 and r.calls["weights"] == 0
+
+
+def test_fix_faces_needs_the_engine_wiring(tmp_path):
+    r = Rig(tmp_path)
+    job = r.swapped()
+    c = TestClient(h3_api.build_h3_app(r.root, r.check, r.swap, r.fetch, lambda: "ready"))
+    f = c.post(f"/fixfaces/{job}", json={}, headers=OK)
+    assert f.status_code == 501 and r.c.get(f"/status/{job}").json()["faces"]["state"] == "idle"
+
+
+def test_fix_faces_read_and_write_hooks(tmp_path):
+    r = Rig(tmp_path, faces_runs=False)
+    job = r.swapped()
+    r.events.clear()
+    r.c.post(f"/fixfaces/{job}", json={}, headers=OK)
+    assert r.events == ["r", "w"]
+    r.events.clear()
+    r.c.get(f"/faces/{job}")
+    assert r.events == ["r"]
+
+
+@pytest.mark.parametrize("job", ["0123456789abcdef", "nothex", "../../etc"])
+def test_fix_faces_unknown_or_malformed_job_ids_are_404(tmp_path, job):
+    r = Rig(tmp_path)
+    assert r.c.get(f"/faces/{job}").status_code == 404
+    assert r.c.post(f"/fixfaces/{job}", json={}, headers=OK).status_code == 404
+
+
+def test_fix_faces_on_a_wan_job_is_409(tmp_path):
+    r = Rig(tmp_path)
+    clip = make_video(tmp_path / "w.mp4", SKIN, n=12, fps=24, w=64, h=64).read_bytes()
+    wan = svc.new_job(r.root, clip, photo_bytes(), ".png", "yes")
+    assert r.c.get(f"/faces/{wan}").status_code == 409
+    assert r.c.post(f"/fixfaces/{wan}", json={}, headers=OK).status_code == 409 and r.faces_calls == 0
+
+
+def test_h3_app_wires_fix_faces_to_its_own_gpu_function_and_only_on_request():
+    body = H3_APP[H3_APP.index("def web("):].split("\n# ----", 1)[0]
+    assert "spawn_faces=faces_job.spawn" in body and 'eng.weights_state(MODELS, stages=("faces",))' in body
+    head = H3_APP[:H3_APP.index("def faces_job(")].rsplit("@app.function", 1)[1]
+    assert "image=image" in head and "gpu=GPU_FACES" in head and "max_containers=1" in head
+    assert 'GPU_FACES = os.environ.get("SYOK_H3_FACES_GPU", GPU_SWAP)' in H3_APP
+    # Fix faces is opt-in: nothing but /fixfaces (and the explicit fixfaces entry point) starts it
+    import re
+    assert H3_APP.count("faces_job.spawn") == 1 and len(re.findall(r"^\s+spawn_faces\(job\)$", H3_API, re.M)) == 1
+    for name in ("def check_job(", "def swap_job("):
+        fn = H3_APP[H3_APP.index(name):].split("\n@app", 1)[0]
+        assert "faces" not in fn
+    gen = H3_API[H3_API.index("def generate("):H3_API.index("def result(")]
+    assert "faces" not in gen
+
+
+def test_h3_app_image_installs_the_fix_faces_packs_and_model_folder():
+    for pack, rev in (("ComfyUI-H3-FaceRefine", "79a97ce5ee4b393ce26313bd1280b706fe8b4f2c"),
+                      ("ComfyUI-Impact-Pack", "5bed9d5545ef430406a5d6d7233e5c0a5e75051a")):
+        assert f'("{pack}", "https://github.com/' in H3_APP and f'"{rev}"' in H3_APP
+    assert "! grep -q 'IMPORT FAILED' /tmp/qt.log" in H3_APP                       # the build still fails on a bad pack
+    assert '"--extra-model-paths-config", EXTRA_MODEL_PATHS' in H3_APP
+    assert 'add_local_file(HERE / "comfy_extra_models.yaml", EXTRA_MODEL_PATHS)' in H3_APP
+    yaml_text = (ROOT / "comfy_extra_models.yaml").read_text()
+    assert "base_path: /h3models" in yaml_text and "ultralytics: ultralytics/" in yaml_text
+    assert '"insightface==0.7.3"' in H3_APP
+    fetch = H3_APP[H3_APP.index("def fetch_models("):H3_APP.index("def model_sizes(")]
+    assert "eng.download_url(s, tmp, m[\"file\"])" in fetch and "eng.verify_download(p, s)" in fetch
+    stage = H3_APP[H3_APP.index("def _stage("):H3_APP.index("@app.function")]
+    assert 'if stage == "faces":' in stage and "models.commit()" in stage.split("finally:", 1)[1]

@@ -1,0 +1,6 @@
+# Extra ComfyUI model folder for Syok Swap H3 Fix faces (passed with --extra-model-paths-config in h3_app.py).
+# ComfyUI has no `ultralytics` folder of its own; H3-FaceRefine's Face Track + Crop lists the files of this folder
+# ("bbox/face_yolov8m.pt", "segm/person_yolov8m-seg.pt"). /h3models is the syok-h3-models Volume.
+syok_h3_faces:
+  base_path: /h3models
+  ultralytics: ultralytics/
