@@ -1,4 +1,4 @@
-"""Syok Swap H3 engine: Openjutsu's 'Simple' swap and 'Check mask' workflows run headlessly in ComfyUI (pure Python here).
+"""Syok Swap H3 engine: Openjutsu's 'Simple' swap, 'Check mask' and 'Fix faces' workflows run headlessly in ComfyUI (pure Python here).
 
 No Modal, no GPU, no network in this file, so every rule is unit-testable. h3_app.py is the Modal side (image, Volumes,
 the ComfyUI process).
@@ -7,16 +7,20 @@ Workflows (copied from D3voz/openjutsu, MIT, see workflows/openjutsu/LICENSE and
     workflows/openjutsu/simple.api.json   the swap: SAM 3.1 tracks the main person, MiniMax H3 redraws them, clip by clip,
                                           through the Context Loop (checkpoints per clip, so a rerun resumes)
     workflows/openjutsu/mask.api.json     the mask check: same SAM + mask settings over the section, cyan/orange preview MP4
+    workflows/openjutsu/face.api.json     Fix faces (optional, opt-in): the photo's face is tracked over the FINISHED swap,
+                                          cropped to 512x512, redrawn by H3 in overlapping chunks and pasted back
 
 The patching below is a Python port of openjutsu lib/simple.ts (pruneSimple, pruneMask, setSection, setResolution,
-cropSource, dropNoLipSync, setMotionSize, suffixRunName) and lib/clips.ts (clip plan estimate), same node ids, same rules.
-lib/model.ts is NOT ported: with the default model files it changes nothing in the export (the export already names them).
+cropSource, dropNoLipSync, setMotionSize, suffixRunName), lib/clips.ts (clip plan estimate) and lib/face.ts (pruneFace,
+faceChunkCount), same node ids / titles, same rules. lib/model.ts is NOT ported: with the default model files it changes
+nothing in the exports' values (the exports already name them; for face.api.json it would only retitle "DMAD LoRA").
 
 A job is a folder under a root directory (on Modal: the `syok-h3-jobs` Volume), with the job folder
-helpers (texture_service.new_job / read_meta / write_meta / set_stage). meta.json carries two H3 stages:
+helpers (texture_service.new_job / read_meta / write_meta / set_stage). meta.json carries three H3 stages:
 
     check   "idle" -> "queued" -> "running" -> "ready" | "error"         small GPU: SAM only, writes check.mp4
     swap    "idle" -> "queued" -> "generating" -> "done" | "error"      big GPU, the paid step: writes h3.mp4
+    faces   "idle" -> "queued" -> "generating" -> "done" | "error"      optional paid step after swap "done": writes faces.mp4
 
 Resume: ComfyUI's output folder for a job is <job>/comfy_out on the Volume. The Context Loop saves each finished clip and
 a checkpoint there, keyed by the Swap Plan's run name, which depends on the inputs. Starting the swap again on the SAME job
@@ -24,9 +28,14 @@ after an error (same files, same settings) therefore continues from the last fin
 same inputs again resumes from the last finished clip"). The settings are frozen at upload, so a resume cannot change them.
 
 Files:  raw.mp4 (source video)  ref.<ext> (new person)  comfy_in/ (ComfyUI input folder)  comfy_out/ (outputs + checkpoints)
-        check.mp4 (mask check preview)  h3.mp4 (swap result)  graph_check.json / graph_swap.json (the exact graph submitted)
+        check.mp4 (mask check preview)  h3.mp4 (swap result)  faces.mp4 (Fix faces result)
+        graph_check.json / graph_swap.json / graph_faces.json (the exact graph submitted)
+
+Fix faces has no checkpoints (openjutsu: the chunks are independent, not chained through the Context Loop), so starting it
+again after an error runs it again from the start.
 """
 import copy
+import hashlib
 import json
 import math
 import re
@@ -68,17 +77,33 @@ MASK_NODES = {"video": "1", "target": "3", "peopleMask": "7", "growMask": "9", "
 MUTE = re.compile(r"^Mute the (clip|reference) audio H3 hears$")
 NO_LIP_SYNC = re.compile(r"^(No lip-sync in the prompt|SAM: faces|SAM 3\.1 track faces|Faces \(shown on the mannequins?\))$")
 
-# Model files the two workflows load, by ComfyUI models/ subfolder (openjutsu README "Models" table, Simple + Check mask only).
+# Fix faces (openjutsu lib/face.ts). Nodes are found by their title, as openjutsu does.
+FACE_STYLES = ("photo", "mouth")          # "Match the photo" (closest likeness) / "Follow the mouth" (keeps the expressions)
+DEFAULT_FACE_STYLE = "photo"
+FACE_VIDEO, FACE_PICTURE = "Video to fix", "Picture 1"
+FACE_CHUNK_SECONDS = {"min": 2.5, "max": 15.0, "default": 6.5}
+FACE_OVERLAP = 24                         # frames (1 s at 24 fps); mirrors H3FaceChunks in comfyui-h3-oneclick-swap
+
+# Model files the workflows load, by ComfyUI models/ subfolder (openjutsu README "Models" table: Simple, Check mask, Fix faces).
 # repo_id / path_in_repo: where each file is downloaded from on Hugging Face. Verified on 21 Nov 2026 by listing each repo's
 # files (names and sizes match the openjutsu README table); the Comfy-Org repos are the official ComfyUI repackages.
 # The files themselves were not downloaded or hash-checked here. fetch still takes --sources to override any of them.
+# The three Fix faces files (21 Nov 2026) carry a sha256 that fetch checks after the download:
+#   face_yolov8m.pt, person_yolov8m-seg.pt: Bingsu/adetailer at a pinned revision, sha256 = the repo's LFS sha256 (HF API).
+#   sam_vit_b_01ec64.pth: Meta's official segment-anything download (the URL in facebookresearch/segment-anything's README
+#   and in Impact Pack's install.py). Downloaded once here: 375042383 bytes, sha256 below, md5 01ec64d2... (the name's suffix).
+# Licences: the YOLO weights are AGPL-3.0 (Ultralytics; openjutsu README), SAM is Apache-2.0. Fix faces also needs InsightFace
+# buffalo_l, which InsightFace downloads into models/insightface on first use: NON-COMMERCIAL research use only.
 MODEL_FILES = [
-    {"folder": "diffusion_models", "file": "minimax_h3_ref2va_pruned_int8_convrot.safetensors", "for": ("swap",)},
-    {"folder": "loras", "file": "minimax_h3_DMAD_4step_full_lora_avg_rank_39_bf16.safetensors", "for": ("swap",)},
-    {"folder": "text_encoders", "file": "qwen3vl_32b_minimax_h3_int4_convrot.safetensors", "for": ("swap",)},
-    {"folder": "text_encoders", "file": "qwen3vl_8b_int8_convrot.safetensors", "for": ("swap",)},
-    {"folder": "vae", "file": "minimax_h3_video_vae_int8_convrot.safetensors", "for": ("swap",)},
-    {"folder": "vae", "file": "minimax_h3_audio_vae_fp32.safetensors", "for": ("swap",)},
+    {"folder": "diffusion_models", "file": "minimax_h3_ref2va_pruned_int8_convrot.safetensors", "for": ("swap", "faces")},
+    {"folder": "loras", "file": "minimax_h3_DMAD_4step_full_lora_avg_rank_39_bf16.safetensors", "for": ("swap", "faces")},
+    {"folder": "text_encoders", "file": "qwen3vl_32b_minimax_h3_int4_convrot.safetensors", "for": ("swap", "faces")},
+    {"folder": "text_encoders", "file": "qwen3vl_8b_int8_convrot.safetensors", "for": ("swap", "faces")},
+    {"folder": "vae", "file": "minimax_h3_video_vae_int8_convrot.safetensors", "for": ("swap", "faces")},
+    {"folder": "vae", "file": "minimax_h3_audio_vae_fp32.safetensors", "for": ("swap", "faces")},
+    {"folder": "ultralytics/bbox", "file": "face_yolov8m.pt", "for": ("faces",)},
+    {"folder": "ultralytics/segm", "file": "person_yolov8m-seg.pt", "for": ("faces",)},
+    {"folder": "sams", "file": "sam_vit_b_01ec64.pth", "for": ("faces",)},
     {"folder": "checkpoints", "file": "sam3.1_multiplex_fp16.safetensors", "for": ("swap", "check")},
 ]
 MODEL_SOURCES = {
@@ -89,15 +114,24 @@ MODEL_SOURCES = {
     "minimax_h3_video_vae_int8_convrot.safetensors": {"repo_id": "Comfy-Org/MiniMax-H3", "path_in_repo": "vae/minimax_h3_video_vae_int8_convrot.safetensors", "revision": None},  # 2.8 GB
     "minimax_h3_audio_vae_fp32.safetensors": {"repo_id": "Comfy-Org/MiniMax-H3", "path_in_repo": "vae/minimax_h3_audio_vae_fp32.safetensors", "revision": None},  # 605 MB
     "sam3.1_multiplex_fp16.safetensors": {"repo_id": "Comfy-Org/sam3.1", "path_in_repo": "checkpoints/sam3.1_multiplex_fp16.safetensors", "revision": None},  # 1.7 GB
+    "face_yolov8m.pt": {"repo_id": "Bingsu/adetailer", "path_in_repo": "face_yolov8m.pt",
+                        "revision": "53cc19de382014514d9d4038601d261a7faa9b7b", "size": 52026019,
+                        "sha256": "717923c19b3f4bbf5250b728f1fa6b2cb72a33aed1d236ea9caf0e21ad943e5f"},
+    "person_yolov8m-seg.pt": {"repo_id": "Bingsu/adetailer", "path_in_repo": "person_yolov8m-seg.pt",
+                              "revision": "53cc19de382014514d9d4038601d261a7faa9b7b", "size": 54827683,
+                              "sha256": "c8ab26f517173b1fe8342d336a09f443eb61cb08dcbfc78d53fff4c2547ae81e"},
+    "sam_vit_b_01ec64.pth": {"url": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth", "size": 375042383,
+                             "sha256": "ec2df62732614e57411cdcf32a23ffdf28910380d03139ee0f4fcbe91eb8c912"},
 }
+OFFICIAL_URL_HOSTS = ("dl.fbaipublicfiles.com",)     # the only non-Hugging-Face host a built-in source may use
 
 
 # ---------------------------------------------------------------- graph helpers (port of lib/simple.ts)
 
 def load_workflow(name):
-    """The bundled API export: "simple" or "mask"."""
-    if name not in ("simple", "mask"):
-        raise ValueError("Workflow must be simple or mask.")
+    """The bundled API export: "simple", "mask" or "face"."""
+    if name not in ("simple", "mask", "face"):
+        raise ValueError("Workflow must be simple, mask or face.")
     return json.loads((WORKFLOW_DIR / f"{name}.api.json").read_text())
 
 
@@ -260,6 +294,61 @@ def check_graph(s, video_name, source=None):
     return bind_inputs(g, MASK_NODES["video"], video_name)
 
 
+# ---------------------------------------------------------------- Fix faces (port of lib/face.ts)
+
+def node_by_title(graph, title):
+    """The one node with this title (openjutsu nodeByTitle)."""
+    ids = [nid for nid, n in graph.items() if (n.get("_meta") or {}).get("title") == title]
+    if len(ids) != 1:
+        raise ValueError(f'Expected one "{title}" node in the workflow, found {len(ids)}.')
+    return ids[0]
+
+
+def face_chunk_count(duration, chunk_seconds):
+    """How many H3 face chunks a video takes, before chunks with only close-ups are dropped (faceChunkCount)."""
+    total = math.floor(duration * FPS)
+    length = (math.floor(chunk_seconds * FPS) - 5) // 17 * 17 + 5
+    return 1 if total <= length else math.ceil((total - FACE_OVERLAP) / (length - FACE_OVERLAP))
+
+
+def prune_face(source, style, seed, chunk_seconds=FACE_CHUNK_SECONDS["default"]):
+    """The Fix faces graph (pruneFace). Match the photo ("photo"): no blurred face to follow, so H3 draws the expressions and
+    mouth anew from the picture. Follow the mouth ("mouth"): the export as is. The source graph is not modified."""
+    if style not in FACE_STYLES:
+        raise ValueError("Face style must be photo or mouth.")
+    graph = copy.deepcopy(source)
+    chunks = graph[node_by_title(graph, "Face Fix Chunks")]["inputs"]
+    if style == "photo":
+        del graph[node_by_title(graph, "Blurred face (follow the mouth)")]
+        del chunks["follow_mouth"]
+        del graph[node_by_title(graph, "Reference Conditioning")]["inputs"]["ref_videos.ref_video_0"]
+    chunks["chunk_seconds"] = chunk_seconds
+    graph[node_by_title(graph, "Seed")]["inputs"]["noise_seed"] = seed
+    check_links(graph)
+    return graph
+
+
+def posix_model_names(graph):
+    """The export was written on Windows ("bbox\\face_yolov8m.pt"). On Linux ComfyUI lists the files of the `ultralytics`
+    model folder as "bbox/face_yolov8m.pt" and refuses a value that is not in the list exactly, so the detector names get
+    forward slashes (openjutsu's own setup check compares them the same way, lib/setup.ts inspectSetup)."""
+    for node in graph.values():
+        if node["class_type"] != "H3FaceTrackCrop":
+            continue
+        for name in ("detector", "fallback_detector"):
+            value = node["inputs"].get(name)
+            if isinstance(value, str) and value != "none":
+                node["inputs"][name] = value.replace("\\", "/")
+    return graph
+
+
+def face_graph(style, seed, video_name, picture_name, chunk_seconds=FACE_CHUNK_SECONDS["default"], source=None):
+    """Everything Fix faces submits: pruned, detector names for Linux, files bound. The whole finished video is fixed (the
+    swap result already is the chosen part), so the loader keeps the export's skip 0 / cap 0."""
+    g = posix_model_names(prune_face(source or load_workflow("face"), style, seed, chunk_seconds))
+    return bind_inputs(g, node_by_title(g, FACE_VIDEO), video_name, node_by_title(g, FACE_PICTURE), picture_name)
+
+
 # ---------------------------------------------------------------- clip plan estimate (port of lib/clips.ts)
 
 OVERLAP = 39
@@ -379,13 +468,20 @@ def plan_section(duration, start, length):
 KIND = "h3"
 VIDEO_NAME = "raw.mp4"
 IN_DIR, OUT_DIR = "comfy_in", "comfy_out"
-CHECK_FILE, SWAP_FILE = "check.mp4", "h3.mp4"
-ACTIVE = {"check": ("queued", "running"), "swap": ("queued", "generating")}
-STUCK_AFTER_SECONDS = {"check": 3600 + 300, "swap": 4 * 3600 + 300}       # the Modal timeouts in h3_app.py plus a margin
+CHECK_FILE, SWAP_FILE, FACES_FILE = "check.mp4", "h3.mp4", "faces.mp4"
+FILES = {"check": CHECK_FILE, "swap": SWAP_FILE, "faces": FACES_FILE}
+DONE = {"check": "ready", "swap": "done", "faces": "done"}
+SWAPPED_INPUT = "swapped.mp4"            # h3.mp4 as Fix faces' loader sees it in comfy_in/
+ACTIVE = {"check": ("queued", "running"), "swap": ("queued", "generating"), "faces": ("queued", "generating")}
+STUCK_AFTER_SECONDS = {"check": 3600 + 300, "swap": 4 * 3600 + 300,       # the Modal timeouts in h3_app.py plus a margin
+                       "faces": 2 * 3600 + 300}
 STUCK_MESSAGE = {
     "check": "The mask check stopped without finishing (Modal's time limit, a restart, or no credit left). Try again.",
     "swap": "The swap stopped without finishing (Modal's time limit, a restart, or no credit left). Start it again on the "
-            "same job: it resumes from the last finished clip."}
+            "same job: it resumes from the last finished clip.",
+    "faces": "Fix faces stopped without finishing (Modal's time limit, a restart, or no credit left). Try again: it runs "
+             "again from the start."}
+IDLE_FACES = {"state": "idle", "attempts": 0}
 
 
 def add_silent_audio(path, probe, run=subprocess.run):
@@ -423,7 +519,7 @@ def new_h3_job(root, video, photo, photo_ext, consent, probe, **settings):
         add_silent_audio(d / VIDEO_NAME, probe)
         meta = tsvc.read_meta(d)
         meta.update(request=s, duration=duration, clips=clip_count(s["length"], s["clip_seconds"]),
-                    check={"state": "idle"}, swap={"state": "idle", "attempts": 0})
+                    check={"state": "idle"}, swap={"state": "idle", "attempts": 0}, faces=dict(IDLE_FACES))
         tsvc.write_meta(d, meta)
     except Exception:
         shutil.rmtree(d, ignore_errors=True)
@@ -467,22 +563,53 @@ def start_swap(root, job, require_check=True):
     return resume
 
 
+def check_faces_start(root, job, mode=DEFAULT_FACE_STYLE):
+    """Every rule start_faces applies, without writing anything (the web API checks these before the model files).
+    Returns (job folder, normalised mode, current faces stage)."""
+    if mode is None or mode == "":
+        mode = DEFAULT_FACE_STYLE
+    if not isinstance(mode, str) or mode not in FACE_STYLES:
+        raise JobError("Mode must be photo (Match the photo) or mouth (Follow the mouth).")
+    d, meta = _h3_meta(root, job)
+    if meta["swap"].get("state") != "done":
+        raise JobError("Fix faces works on the finished swap. Wait for the swap to finish.", 409)
+    faces = meta.get("faces") or dict(IDLE_FACES)
+    state = faces.get("state", "idle")
+    if state in ACTIVE["faces"]:
+        raise JobError("Fix faces is already running for this clip.", 409)
+    if state == "done":
+        raise JobError("The faces of this clip are already fixed. Start a new job to fix them again.", 409)
+    return d, mode, faces
+
+
+def start_faces(root, job, mode=DEFAULT_FACE_STYLE):
+    """Queue the optional paid Fix faces step on the finished swap. Allowed from "idle" or after an "error" (it then runs
+    again from the start: there are no checkpoints). Refused before the swap is done, while queued or running, and once done
+    (no double billing). `mode` is "photo" (Match the photo) or "mouth" (Follow the mouth). Returns True when it is a retry."""
+    d, mode, faces = check_faces_start(root, job, mode)
+    state, attempts = faces.get("state", "idle"), int(faces.get("attempts", 0))
+    retry = state == "error" and attempts > 0
+    tsvc.set_stage(d, "faces", state="queued", message=None, mode=mode, attempts=attempts + 1, resume=retry,
+                   started=time.time())
+    return retry
+
+
 def begin(root, job, stage):
     """The GPU function picked the job up."""
     d, meta = _h3_meta(root, job)
-    if meta[stage].get("state") != "queued":
+    if (meta.get(stage) or {}).get("state") != "queued":
         raise JobError(f"The {stage} step is not queued.", 409)
     tsvc.set_stage(d, stage, state="running" if stage == "check" else "generating")
 
 
 def finish(root, job, stage, produced):
-    """Store the file ComfyUI made as check.mp4 / h3.mp4 in the job folder and mark the stage finished."""
+    """Store the file ComfyUI made as check.mp4 / h3.mp4 / faces.mp4 in the job folder and mark the stage finished."""
     d, _ = _h3_meta(root, job)
-    name = CHECK_FILE if stage == "check" else SWAP_FILE
+    name = FILES[stage]
     tmp = d / (name + ".tmp")
     shutil.copyfile(produced, tmp)
     tmp.replace(d / name)
-    tsvc.set_stage(d, stage, state="ready" if stage == "check" else "done", file=name,
+    tsvc.set_stage(d, stage, state=DONE[stage], file=name,
                    bytes=(d / name).stat().st_size, finished=time.time())
 
 
@@ -503,15 +630,15 @@ def _expire_stuck(d, meta, now):
 def status(root, job, now=None):
     d, _ = _h3_meta(root, job)
     m = _expire_stuck(d, tsvc.read_meta(d), time.time() if now is None else now)
-    return {"job": job, "engine": m.get("engine"), "check": m["check"], "swap": m["swap"], "request": m["request"],
+    return {"job": job, "engine": m.get("engine"), "check": m["check"], "swap": m["swap"],
+            "faces": m.get("faces") or dict(IDLE_FACES), "request": m["request"],
             "clips": m.get("clips"), "expires_at": m["created"] + tsvc.JOB_TTL_SECONDS}
 
 
 def result_path(root, job, stage):
     d, meta = _h3_meta(root, job)
-    name = CHECK_FILE if stage == "check" else SWAP_FILE
-    done = "ready" if stage == "check" else "done"
-    if meta[stage].get("state") != done or not (d / name).exists():
+    name = FILES[stage]
+    if (meta.get(stage) or {}).get("state") != DONE[stage] or not (d / name).exists():
         raise JobError(f"The {stage} result is not ready yet.", 409)
     return d / name
 
@@ -527,12 +654,28 @@ def stage_inputs(d, meta):
     return video_name, picture_name
 
 
+def stage_swapped(d):
+    """Copy the finished swap (h3.mp4) into the ComfyUI input folder for Fix faces. Returns its name there."""
+    src, dst = Path(d) / SWAP_FILE, Path(d) / IN_DIR / SWAPPED_INPUT
+    if not src.is_file():
+        raise JobError("The swap result is missing.", 409)
+    if not dst.exists() or dst.stat().st_size != src.stat().st_size:
+        shutil.copyfile(src, dst)
+    return SWAPPED_INPUT
+
+
 def graph_for(root, job, stage):
-    """The exact graph a stage submits, also saved as graph_<stage>.json in the job folder for debugging."""
+    """The exact graph a stage submits, also saved as graph_<stage>.json in the job folder for debugging. Fix faces reads
+    the finished swap and the same photo, with the job's seed and the mode chosen when it was queued."""
     d, meta = _h3_meta(root, job)
     video_name, picture_name = stage_inputs(d, meta)
     s = meta["request"]
-    g = check_graph(s, video_name) if stage == "check" else swap_graph(s, video_name, picture_name)
+    if stage == "faces":
+        g = face_graph((meta.get("faces") or {}).get("mode", DEFAULT_FACE_STYLE), s["seed"], stage_swapped(d), picture_name)
+    elif stage == "check":
+        g = check_graph(s, video_name)
+    else:
+        g = swap_graph(s, video_name, picture_name)
     (d / f"graph_{stage}.json").write_text(json.dumps(g, indent=1))
     return g
 
@@ -607,16 +750,57 @@ def resolve_sources(overrides=None):
     return src
 
 
+def sha256_of(path, chunk=1 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def verify_download(path, source):
+    """Raise (and delete the file) when a downloaded file does not match the size / sha256 its source records."""
+    path = Path(path)
+    want_size, want_sha = source.get("size"), source.get("sha256")
+    if want_size is not None and path.stat().st_size != want_size:
+        path.unlink(missing_ok=True)
+        raise ValueError(f"{path.name}: downloaded size does not match the verified source.")
+    if want_sha and sha256_of(path) != want_sha:
+        path.unlink(missing_ok=True)
+        raise ValueError(f"{path.name}: sha256 does not match the verified source.")
+
+
+def download_url(source, dest_dir, name, opener=None):
+    """Download a built-in URL source (an official host only, with a recorded sha256) into dest_dir/name; checked after.
+    `opener(url)` returns a file-like response (urllib.request.urlopen by default; a fake in tests)."""
+    from urllib.parse import urlparse
+    url = source.get("url") or ""
+    parts = urlparse(url)
+    if parts.scheme != "https" or parts.hostname not in OFFICIAL_URL_HOSTS or not source.get("sha256"):
+        raise ValueError(f"{name}: a URL source must be https on an official host and carry a sha256.")
+    if opener is None:
+        import urllib.request
+        opener = lambda u: urllib.request.urlopen(u, timeout=60)  # noqa: E731
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    out = dest_dir / name
+    with opener(url) as r, open(out, "wb") as f:
+        shutil.copyfileobj(r, f, 1 << 20)
+    verify_download(out, source)
+    return out
+
+
 FETCH_FLAG = ".h3-fetch-started"            # in the models Volume root while h3_app.fetch_models runs
 FETCH_STALE_SECONDS = 4 * 3600 + 300        # fetch_models' Modal timeout plus a margin: a flag older than this is a dead fetch
 
 
-def weights_state(models_dir, now=None, stale=FETCH_STALE_SECONDS):
+def weights_state(models_dir, now=None, stale=FETCH_STALE_SECONDS, stages=("swap", "check")):
     """"ready" | "downloading" | "missing" for the H3 model files (the web API's /health and /setup).
-    ready = no file is missing for either stage (models_missing). downloading = files are missing but a fetch wrote its
+    ready = no file is missing for any of `stages` (models_missing; the swap and the check by default, so the optional
+    Fix faces files never hold up a swap; POST /fixfaces asks with stages=("faces",)). downloading = files are missing but a fetch wrote its
     start flag less than `stale` seconds ago. Anything else (no flag, unreadable flag, a fetch that died) is missing,
     so /setup can start the fetch again; files already on the Volume are not downloaded twice."""
-    if not models_missing(models_dir, "swap") and not models_missing(models_dir, "check"):
+    if not any(models_missing(models_dir, st) for st in stages):
         return "ready"
     flag = Path(models_dir) / FETCH_FLAG
     if flag.is_file():

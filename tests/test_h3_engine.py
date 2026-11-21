@@ -19,6 +19,7 @@ from test_texture_service import SKIN, photo_bytes
 
 GRAPH = h3.load_workflow("simple")
 MASK = h3.load_workflow("mask")
+FACE = h3.load_workflow("face")
 HAT_TYPES = ["CLIPTextEncode", "SAM3_VideoTrack", "SAM3_TrackToMask", "GrowMaskWithBlur", "MaskComposite", "MaskComposite"]
 
 
@@ -69,17 +70,29 @@ def test_node_ids_match_the_export():
 
 
 def test_model_manifest_matches_the_loaders_in_the_exports():
-    """Every file a loader names in the two exports is in MODEL_FILES, in the right folder, and nothing else is."""
+    """Every file a loader names in the three exports is in MODEL_FILES, in the right folder, and nothing else is."""
     loader_folder = {"UNETLoader": ("unet_name", "diffusion_models"), "LoraLoaderModelOnly": ("lora_name", "loras"),
                      "CLIPLoader": ("clip_name", "text_encoders"), "VAELoader": ("vae_name", "vae"),
-                     "CheckpointLoaderSimple": ("ckpt_name", "checkpoints")}
+                     "CheckpointLoaderSimple": ("ckpt_name", "checkpoints"), "SAMLoader": ("model_name", "sams")}
     named = set()
-    for g in (GRAPH, MASK):
+    for g in (GRAPH, MASK, h3.face_graph("mouth", 0, "v.mp4", "p.png")):
         for n in g.values():
             if n["class_type"] in loader_folder:
                 key, folder = loader_folder[n["class_type"]]
                 named.add((folder, n["inputs"][key]))
+            if n["class_type"] == "H3FaceTrackCrop":         # names inside the `ultralytics` folder: "bbox/x.pt"
+                for key in ("detector", "fallback_detector"):
+                    if n["inputs"][key] != "none":
+                        sub, name = n["inputs"][key].split("/")
+                        named.add((f"ultralytics/{sub}", name))
     assert named == {(m["folder"], m["file"]) for m in h3.MODEL_FILES}
+    face_needs = {(m["folder"], m["file"]) for m in h3.MODEL_FILES if "faces" in m["for"]}
+    face_named = set()
+    for n in h3.face_graph("photo", 0, "v.mp4", "p.png").values():
+        if n["class_type"] in loader_folder:
+            key, folder = loader_folder[n["class_type"]]
+            face_named.add((folder, n["inputs"][key]))
+    assert face_named <= face_needs and len(face_needs) == len(face_named) + 2     # + the two YOLO detectors
     check_needs = {(n["class_type"]) for n in MASK.values() if n["class_type"] in loader_folder}
     assert check_needs == {"CheckpointLoaderSimple"}
     assert [m["file"] for m in h3.MODEL_FILES if "check" in m["for"]] == ["sam3.1_multiplex_fp16.safetensors"]
@@ -483,6 +496,10 @@ def test_model_sources_are_the_verified_ones_and_never_guessed():
     # one source per model file, no more and no fewer, each a real owner/name repo with a path (verified 21 Nov 2026)
     assert set(h3.MODEL_SOURCES) == {m["file"] for m in h3.MODEL_FILES}
     for f, v in h3.MODEL_SOURCES.items():
+        if "url" in v:      # an official non-HF download: https on an official host, exact size and sha256 recorded
+            assert v["url"].startswith("https://") and v["url"].split("/")[2] in h3.OFFICIAL_URL_HOSTS and v["url"].endswith("/" + f)
+            assert len(v["sha256"]) == 64 and int(v["sha256"], 16) >= 0 and v["size"] > 0 and "repo_id" not in v
+            continue
         assert v["repo_id"].count("/") == 1 and v["path_in_repo"].endswith(f)
     assert h3.MODEL_SOURCES["sam3.1_multiplex_fp16.safetensors"]["repo_id"] == "Comfy-Org/sam3.1"
     assert h3.MODEL_SOURCES["qwen3vl_32b_minimax_h3_int4_convrot.safetensors"]["repo_id"] == "Merserk/MiniMax-H3-INT4-ConvRot"
@@ -546,3 +563,336 @@ def test_failure_to_add_audio_is_a_clear_error_and_leaves_no_temp_file(tmp_path)
     with pytest.raises(JobError):
         h3.add_silent_audio(f, lambda p: {"has_audio": False}, run=lambda *a, **k: R())
     assert f.read_bytes() == b"x" and not list(tmp_path.glob("with_audio_*"))
+
+
+# ---------------------------------------------------------------- Fix faces graph (face.test.ts, lib/face.ts)
+
+def dangling(g):
+    return [f"{nid}.{name}" for nid, n in g.items() for name, v in n["inputs"].items() if h3.is_link(v) and v[0] not in g]
+
+
+def titled(g, title):
+    return g[h3.node_by_title(g, title)]
+
+
+def test_bundled_face_export_is_openjutsus_file():
+    """Byte-identical to openjutsu's workflows/face.api.json at commit 7fe118b (7fe118bb5a61fcfac0148e1bfea3dd29884dbf26)."""
+    import hashlib
+    want = "6ebc74af833a352ec68e19ba2be6ef43fca132c426cb22c11bfd99d10548dd81"
+    assert hashlib.sha256((h3.WORKFLOW_DIR / "face.api.json").read_bytes()).hexdigest() == want
+    assert len(FACE) == 30
+
+
+def test_the_face_export_has_the_video_the_picture_and_follow_the_mouth_on():
+    assert titled(FACE, h3.FACE_VIDEO)["class_type"] == "VHS_LoadVideo"
+    assert titled(FACE, h3.FACE_PICTURE)["class_type"] == "LoadImage"
+    assert titled(FACE, "Face Fix Chunks")["inputs"]["follow_mouth"] == [h3.node_by_title(FACE, "Blurred face (follow the mouth)"), 0]
+    assert titled(FACE, "Reference Conditioning")["inputs"]["ref_videos.ref_video_0"]
+    chunks = titled(FACE, "Face Fix Chunks")["inputs"]
+    assert (chunks["chunk_seconds"], chunks["skip_faces_above"]) == (6.5, 0.2)       # 6.5 s chunks, faces > 1/5 left alone
+    for t in ("Track + crop the face", "Face from picture 1"):
+        assert (titled(FACE, t)["inputs"]["canvas_width"], titled(FACE, t)["inputs"]["canvas_height"]) == (512, 512)
+    assert titled(FACE, h3.FACE_VIDEO)["inputs"]["force_rate"] == 24 and titled(FACE, "Fixed video")["inputs"]["frame_rate"] == 24
+
+
+def test_follow_the_mouth_keeps_the_graph_and_sets_the_seed_and_chunk_length():
+    pruned = h3.prune_face(FACE, "mouth", 7, 5)
+    assert len(pruned) == len(FACE)
+    assert titled(pruned, "Seed")["inputs"]["noise_seed"] == 7
+    assert titled(pruned, "Face Fix Chunks")["inputs"]["chunk_seconds"] == 5
+    assert titled(FACE, "Seed")["inputs"]["noise_seed"] == 0, "the source graph is not modified"
+
+
+def test_match_the_photo_drops_exactly_the_blurred_face_and_the_motion_reference():
+    pruned = h3.prune_face(FACE, "photo", 7, 5)
+    assert dangling(pruned) == []
+    assert len(pruned) == len(FACE) - 1
+    assert set(FACE) - set(pruned) == {h3.node_by_title(FACE, "Blurred face (follow the mouth)")}
+    assert "follow_mouth" not in titled(pruned, "Face Fix Chunks")["inputs"]
+    ref = titled(pruned, "Reference Conditioning")["inputs"]
+    assert sorted(k for k in ref if k.startswith("ref_")) == ["ref_image_size", "ref_images.ref_image_0"]
+    # nothing else changed: every other node and input is the export's, apart from the seed and chunk length
+    for nid, node in pruned.items():
+        want = json.loads(json.dumps(FACE[nid]))
+        if nid == h3.node_by_title(FACE, "Face Fix Chunks"):
+            del want["inputs"]["follow_mouth"]
+            want["inputs"]["chunk_seconds"] = 5
+        if nid == h3.node_by_title(FACE, "Reference Conditioning"):
+            del want["inputs"]["ref_videos.ref_video_0"]
+        if nid == h3.node_by_title(FACE, "Seed"):
+            want["inputs"]["noise_seed"] = 7
+        assert node == want, nid
+    assert "follow_mouth" in titled(FACE, "Face Fix Chunks")["inputs"], "the source graph is not modified"
+
+
+def test_prune_face_refuses_an_unknown_style_and_a_missing_title():
+    with pytest.raises(ValueError, match="photo or mouth"):
+        h3.prune_face(FACE, "both", 0)
+    g = json.loads(json.dumps(FACE))
+    g["99"] = json.loads(json.dumps(g[h3.node_by_title(g, "Seed")]))
+    with pytest.raises(ValueError, match='one "Seed" node'):
+        h3.prune_face(g, "photo", 0)
+
+
+def test_face_chunk_count_mirrors_h3_face_fix_chunks():
+    # 413 frames, 6.5 s chunks of 141 frames overlapping by at least 24: 4 chunks; a short video is one chunk
+    assert h3.face_chunk_count(413 / 24, 6.5) == 4
+    assert h3.face_chunk_count(413 / 24, 6.6) == 3
+    assert h3.face_chunk_count(4, 6.5) == 1
+
+
+def test_detector_names_use_forward_slashes_on_linux_and_nothing_else_changes():
+    g = h3.face_graph("photo", 3, "swapped.mp4", "picture.png")
+    track, own = titled(g, "Track + crop the face")["inputs"], titled(g, "Face from picture 1")["inputs"]
+    assert (track["detector"], track["fallback_detector"]) == ("bbox/face_yolov8m.pt", "segm/person_yolov8m-seg.pt")
+    assert (own["detector"], own["fallback_detector"]) == ("bbox/face_yolov8m.pt", "none")
+    assert titled(FACE, "Track + crop the face")["inputs"]["detector"] == "bbox\\face_yolov8m.pt"
+    assert titled(g, h3.FACE_VIDEO)["inputs"]["video"] == "swapped.mp4"
+    assert titled(g, h3.FACE_PICTURE)["inputs"]["image"] == "picture.png"
+    v = titled(g, h3.FACE_VIDEO)["inputs"]
+    assert (v["skip_first_frames"], v["frame_load_cap"]) == (0, 0)          # the whole finished swap
+    assert titled(g, "Seed")["inputs"]["noise_seed"] == 3 and dangling(g) == []
+    assert titled(g, "Face Fix Chunks")["inputs"]["chunk_seconds"] == h3.FACE_CHUNK_SECONDS["default"] == 6.5
+
+
+def test_fix_faces_keeps_the_soundtrack_of_the_video_it_fixes():
+    """The fixed video gets the loaded video's own audio (the swap result, which carries the original soundtrack), and H3
+    preserves the source audio in the edit latent."""
+    g = h3.face_graph("mouth", 0, "swapped.mp4", "picture.png")
+    video = h3.node_by_title(g, h3.FACE_VIDEO)
+    assert titled(g, "Fixed video")["inputs"]["audio"] == [video, 2]
+    assert titled(g, "Masked target")["inputs"]["audio_mode"] == "preserve source audio"
+    assert titled(g, "Edit latent (face + audio)")["inputs"]["keep_audio"] is True
+
+
+def test_every_face_node_class_comes_from_core_or_a_pinned_pack():
+    """The node classes face.api.json uses, by where they were found in the pinned sources (checked 21 Nov 2026)."""
+    packs = {"H3FaceTrackCrop": "ComfyUI-H3-FaceRefine", "H3FaceMaskSAM": "ComfyUI-H3-FaceRefine",
+             "H3FaceStitch": "ComfyUI-H3-FaceRefine", "SAMLoader": "ComfyUI-Impact-Pack",
+             "H3FaceChunks": "comfyui-h3-oneclick-swap", "H3FaceJoin": "comfyui-h3-oneclick-swap",
+             "MiniMaxH3FantasticVideoEditLatent": "ComfyUI-Fantastic-MiniMaxH3-PromptBuilder",
+             "MiniMaxH3ContexMaskedTarget": "ComfyUI-MiniMaxH3-Context-Loop",
+             "VHS_LoadVideo": "ComfyUI-VideoHelperSuite", "VHS_VideoCombine": "ComfyUI-VideoHelperSuite"}
+    core = {"LoadImage", "ImageScaleToMaxDimension", "CLIPLoader", "TextGenerate", "ImageBlur", "UNETLoader",
+            "LoraLoaderModelOnly", "ModelAttentionBackend", "VAELoader", "MiniMaxH3ReferenceToVideo", "BasicGuider",
+            "KSamplerSelect", "RandomNoise", "BasicScheduler", "SamplerCustomAdvanced", "VAEDecode"}
+    assert {n["class_type"] for n in FACE.values()} == set(packs) | core
+    app_src = (Path(h3.__file__).parent / "h3_app.py").read_text()
+    for pack in set(packs.values()):
+        assert f'("{pack}", "https://github.com/' in app_src, pack
+
+
+# ---------------------------------------------------------------- Fix faces stage (meta.json)
+
+def swapped_job(tmp_path, clip_bytes, **kw):
+    root, job = new_job(tmp_path, clip_bytes, **kw)
+    h3.start_check(root, job); h3.begin(root, job, "check")
+    h3.finish(root, job, "check", make_video(tmp_path / "c.mp4", SKIN, n=4, fps=24, w=32, h=32))
+    return root, job
+
+
+def finish_swap(tmp_path, root, job):
+    h3.start_swap(root, job); h3.begin(root, job, "swap")
+    h3.finish(root, job, "swap", make_video(tmp_path / "s.mp4", SKIN, n=8, fps=24, w=32, h=32))
+
+
+def test_a_new_job_has_an_idle_faces_stage(tmp_path, clip_bytes):
+    root, job = new_job(tmp_path, clip_bytes)
+    assert svc.read_meta(svc.job_dir(root, job))["faces"] == {"state": "idle", "attempts": 0}
+    assert h3.status(root, job)["faces"] == {"state": "idle", "attempts": 0}
+
+
+def test_fix_faces_needs_the_finished_swap(tmp_path, clip_bytes):
+    root, job = swapped_job(tmp_path, clip_bytes)
+    with pytest.raises(JobError, match="finished swap") as e:
+        h3.start_faces(root, job)
+    assert e.value.status == 409
+    h3.start_swap(root, job)
+    with pytest.raises(JobError, match="finished swap"):
+        h3.start_faces(root, job)
+    h3.begin(root, job, "swap")
+    with pytest.raises(JobError, match="finished swap"):
+        h3.start_faces(root, job)
+    assert h3.status(root, job)["faces"]["state"] == "idle"
+
+
+def test_fix_faces_runs_once_then_is_done(tmp_path, clip_bytes):
+    root, job = swapped_job(tmp_path, clip_bytes)
+    finish_swap(tmp_path, root, job)
+    assert h3.start_faces(root, job, "mouth") is False
+    st = h3.status(root, job)["faces"]
+    assert (st["state"], st["mode"], st["attempts"], st["resume"], st["message"]) == ("queued", "mouth", 1, False, None)
+    with pytest.raises(JobError, match="already running") as e:
+        h3.start_faces(root, job)
+    assert e.value.status == 409
+    with pytest.raises(JobError, match="not ready"):
+        h3.result_path(root, job, "faces")
+    h3.begin(root, job, "faces")
+    assert h3.status(root, job)["faces"]["state"] == "generating"
+    with pytest.raises(JobError, match="already running"):
+        h3.start_faces(root, job)
+    out = make_video(tmp_path / "f.mp4", SKIN, n=8, fps=24, w=32, h=32)
+    h3.finish(root, job, "faces", out)
+    st = h3.status(root, job)["faces"]
+    assert (st["state"], st["file"]) == ("done", "faces.mp4")
+    assert h3.result_path(root, job, "faces").read_bytes() == out.read_bytes()
+    assert h3.result_path(root, job, "swap").name == "h3.mp4"                      # the original stays next to it
+    with pytest.raises(JobError, match="already fixed") as e:
+        h3.start_faces(root, job)
+    assert e.value.status == 409
+
+
+@pytest.mark.parametrize("mode", ["both", "PHOTO", 1, ["photo"]])
+def test_fix_faces_refuses_an_unknown_mode_and_writes_nothing(tmp_path, clip_bytes, mode):
+    root, job = swapped_job(tmp_path, clip_bytes)
+    finish_swap(tmp_path, root, job)
+    with pytest.raises(JobError, match="photo") as e:
+        h3.start_faces(root, job, mode)
+    assert e.value.status == 400 and h3.status(root, job)["faces"]["state"] == "idle"
+
+
+def test_fix_faces_defaults_to_match_the_photo(tmp_path, clip_bytes):
+    root, job = swapped_job(tmp_path, clip_bytes)
+    finish_swap(tmp_path, root, job)
+    h3.start_faces(root, job, None)
+    assert h3.status(root, job)["faces"]["mode"] == "photo"
+
+
+def test_a_failed_fix_faces_can_be_tried_again(tmp_path, clip_bytes):
+    root, job = swapped_job(tmp_path, clip_bytes)
+    finish_swap(tmp_path, root, job)
+    h3.start_faces(root, job, "photo"); h3.begin(root, job, "faces")
+    h3.fail(root, job, "faces", "Fix faces failed. Try again: it runs again from the start.")
+    assert h3.status(root, job)["faces"]["message"].startswith("Fix faces failed")
+    assert h3.start_faces(root, job, "mouth") is True
+    st = h3.status(root, job)["faces"]
+    assert (st["state"], st["attempts"], st["resume"], st["mode"], st["message"]) == ("queued", 2, True, "mouth", None)
+    assert h3.status(root, job)["swap"]["state"] == "done"                         # the swap result is untouched
+
+
+def test_a_fix_faces_run_that_died_silently_is_reported(tmp_path, clip_bytes):
+    root, job = swapped_job(tmp_path, clip_bytes)
+    finish_swap(tmp_path, root, job)
+    h3.start_faces(root, job); h3.begin(root, job, "faces")
+    at = svc.read_meta(svc.job_dir(root, job))["faces"]["at"]
+    assert h3.status(root, job, now=at + 60)["faces"]["state"] == "generating"
+    st = h3.status(root, job, now=at + h3.STUCK_AFTER_SECONDS["faces"] + 1)["faces"]
+    assert st["state"] == "error" and "from the start" in st["message"]
+    assert h3.status(root, job)["swap"]["state"] == "done"
+    assert h3.start_faces(root, job) is True
+
+
+def test_a_job_made_before_fix_faces_reads_as_idle_and_can_start_it(tmp_path, clip_bytes):
+    root, job = swapped_job(tmp_path, clip_bytes)
+    finish_swap(tmp_path, root, job)
+    d = svc.job_dir(root, job)
+    meta = svc.read_meta(d)
+    del meta["faces"]
+    svc.write_meta(d, meta)
+    assert h3.status(root, job)["faces"] == {"state": "idle", "attempts": 0}
+    with pytest.raises(JobError, match="not ready"):
+        h3.result_path(root, job, "faces")
+    with pytest.raises(JobError, match="not queued"):
+        h3.begin(root, job, "faces")
+    assert h3.start_faces(root, job) is False
+
+
+def test_graph_for_faces_reads_the_finished_swap_and_the_same_photo(tmp_path, clip_bytes):
+    root, job = swapped_job(tmp_path, clip_bytes, seed=11)
+    d = svc.job_dir(root, job)
+    h3.start_swap(root, job); h3.begin(root, job, "swap")
+    with pytest.raises(JobError, match="swap result is missing"):
+        h3.stage_swapped(d)
+    h3.finish(root, job, "swap", make_video(tmp_path / "s.mp4", SKIN, n=8, fps=24, w=32, h=32))
+    h3.start_faces(root, job, "photo")
+    g = h3.graph_for(root, job, "faces")
+    assert (d / "comfy_in" / "swapped.mp4").read_bytes() == (d / "h3.mp4").read_bytes()
+    assert titled(g, h3.FACE_VIDEO)["inputs"]["video"] == "swapped.mp4"
+    assert titled(g, h3.FACE_PICTURE)["inputs"]["image"] == "picture.png"
+    assert titled(g, "Seed")["inputs"]["noise_seed"] == 11
+    assert "follow_mouth" not in titled(g, "Face Fix Chunks")["inputs"]                    # Match the photo
+    assert json.loads((d / "graph_faces.json").read_text()) == g
+
+
+# ---------------------------------------------------------------- Fix faces model files and downloads
+
+def test_fix_faces_model_files_and_their_verified_sources():
+    faces = {f"{m['folder']}/{m['file']}" for m in h3.MODEL_FILES if "faces" in m["for"]}
+    assert {"ultralytics/bbox/face_yolov8m.pt", "ultralytics/segm/person_yolov8m-seg.pt", "sams/sam_vit_b_01ec64.pth"} <= faces
+    assert "checkpoints/sam3.1_multiplex_fp16.safetensors" not in faces
+    for name in ("face_yolov8m.pt", "person_yolov8m-seg.pt"):
+        src = h3.MODEL_SOURCES[name]
+        assert src["repo_id"] == "Bingsu/adetailer" and src["path_in_repo"] == name
+        assert src["revision"] == "53cc19de382014514d9d4038601d261a7faa9b7b" and len(src["sha256"]) == 64
+    assert h3.MODEL_SOURCES["face_yolov8m.pt"]["size"] == 52026019
+    assert h3.MODEL_SOURCES["person_yolov8m-seg.pt"]["size"] == 54827683
+    sam = h3.MODEL_SOURCES["sam_vit_b_01ec64.pth"]
+    assert sam["url"] == "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
+    assert (sam["size"], sam["sha256"]) == (375042383, "ec2df62732614e57411cdcf32a23ffdf28910380d03139ee0f4fcbe91eb8c912")
+
+
+def test_models_missing_for_faces(tmp_path):
+    assert len(h3.models_missing(tmp_path, "faces")) == 9
+    assert h3.models_missing(tmp_path, "check") == ["checkpoints/sam3.1_multiplex_fp16.safetensors"]
+
+
+def test_missing_fix_faces_files_never_hold_up_the_swap(tmp_path):
+    for m in h3.MODEL_FILES:
+        if "faces" in m["for"] and m["for"] == ("faces",):
+            continue
+        (tmp_path / m["folder"]).mkdir(parents=True, exist_ok=True)
+        (tmp_path / m["folder"] / m["file"]).write_bytes(b"x")
+    assert h3.weights_state(tmp_path) == "ready"
+    assert h3.weights_state(tmp_path, stages=("faces",)) == "missing"
+    (tmp_path / h3.FETCH_FLAG).write_text("1000")
+    assert h3.weights_state(tmp_path, now=1060, stages=("faces",)) == "downloading"
+    for m in h3.MODEL_FILES:
+        (tmp_path / m["folder"]).mkdir(parents=True, exist_ok=True)
+        (tmp_path / m["folder"] / m["file"]).write_bytes(b"x")
+    assert h3.weights_state(tmp_path, stages=("faces",)) == "ready"
+
+
+class _Resp:
+    def __init__(self, data):
+        import io
+        self.f = io.BytesIO(data)
+
+    def read(self, *a):
+        return self.f.read(*a)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_url_downloads_are_hash_checked_and_official_hosts_only(tmp_path):
+    import hashlib
+    data = b"fictional checkpoint bytes"
+    good = {"url": "https://dl.fbaipublicfiles.com/segment_anything/x.pth", "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest()}
+    seen = []
+    out = h3.download_url(good, tmp_path / "p", "x.pth", opener=lambda u: seen.append(u) or _Resp(data))
+    assert out.read_bytes() == data and seen == [good["url"]]
+    with pytest.raises(ValueError, match="sha256 does not match"):
+        h3.download_url(dict(good, size=None), tmp_path / "p", "y.pth", opener=lambda u: _Resp(b"tampered"))
+    assert not (tmp_path / "p" / "y.pth").exists()
+    with pytest.raises(ValueError, match="size does not match"):
+        h3.download_url(good, tmp_path / "p", "z.pth", opener=lambda u: _Resp(data + b"!"))
+    assert not (tmp_path / "p" / "z.pth").exists()
+    for bad in (dict(good, url="http://dl.fbaipublicfiles.com/x.pth"), dict(good, url="https://example.com/x.pth"),
+                dict(good, sha256="")):
+        with pytest.raises(ValueError, match="official host"):
+            h3.download_url(bad, tmp_path / "p", "w.pth", opener=lambda u: pytest.fail("must not download"))
+
+
+def test_verify_download_passes_sources_without_a_hash(tmp_path):
+    f = tmp_path / "a.bin"
+    f.write_bytes(b"abc")
+    h3.verify_download(f, {"repo_id": "a/b"})                  # the older sources record no size / sha256
+    assert f.exists()
+    h3.verify_download(f, {"size": 3, "sha256": h3.sha256_of(f)})
+    with pytest.raises(ValueError):
+        h3.verify_download(f, {"size": 4})
+    assert not f.exists()

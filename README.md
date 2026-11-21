@@ -4,6 +4,8 @@ Replace the person in a video with a character from **one photo**. Open, self-ho
 
 - **Engine:** MiniMax H3 through ComfyUI, using openjutsu's Simple swap and Check mask workflows (`h3_engine.py`,
   `h3_app.py`, `h3_api.py`). Modal app name: `syok-swap-h3`. Details: `docs/H3.md`.
+- **Fix faces (optional, opt-in, paid):** openjutsu's Fix faces on the finished swap. It uses the InsightFace `buffalo_l`
+  face model, which is for non-commercial research use only (and AGPL-3.0 YOLO weights), so it never runs by itself.
 - **Licence territory:** MiniMax H3's licence excludes the US, the EU, the UK and South Korea. The web API refuses those
   countries (fail closed) on the router's `X-Syok-Country` header plus a tick box; this is a safeguard, not legal
   compliance. See `docs/H3_TERRITORY.md`.
@@ -16,6 +18,7 @@ modal run h3_app.py::fetch                                   # once, about 51 GB
 modal run h3_app.py::new   --video clip.mp4 --photo face.png --consent yes --length 6
 modal run h3_app.py::check --job <id printed above>          # small GPU: mask preview (cyan = regenerated)
 modal run h3_app.py::swap  --job <id>                        # big GPU, the paid step
+modal run h3_app.py::fixfaces --job <id> --mode photo         # optional, paid: Fix faces on the finished swap
 ```
 
 Or use the GitHub Actions workflows in your own fork: **deploy Syok Swap H3 engine to my Modal** (`deploy-h3.yml`) and

@@ -1,4 +1,5 @@
-"""Syok Swap H3: openjutsu's 'Simple' swap and 'Check mask' run headlessly in ComfyUI on the user's own Modal account.
+"""Syok Swap H3: openjutsu's 'Simple' swap, 'Check mask' and optional 'Fix faces' run headlessly in ComfyUI on the user's own
+Modal account.
 
 Modal app "syok-swap-h3" with its own two Volumes. Deployed and live-tested (21 Nov 2026, 6 s at 480p); see docs/H3.md
 for what is measured and what is not. The web endpoint (web(), h3_api.py) is the one the Syok router calls.
@@ -7,11 +8,14 @@ for what is measured and what is not. The web endpoint (web(), h3_api.py) is the
     modal run h3_app.py::new --video v.mp4 --photo p.png --consent yes [--margin normal --start 0 --length 6 --seed 0 --resolution 480p]
     modal run h3_app.py::check --job <id> [--out check.mp4]    # small GPU: SAM 3.1 mask preview (cyan = regenerated)
     modal run h3_app.py::swap  --job <id> [--out h3.mp4]       # big GPU, the paid step; run it again after an error to RESUME
+    modal run h3_app.py::fixfaces --job <id> [--mode photo|mouth] [--out faces.mp4]   # OPTIONAL paid step on the finished swap
     modal run h3_app.py::status --job <id>
 
 Settings chosen at deploy/run time through environment variables (read where `modal deploy` / `modal run` runs):
     SYOK_H3_GPU          GPU for the swap (default "L40S"; openjutsu was only tested on a 16 GB RTX 4060 Ti + 64 GB RAM)
     SYOK_H3_CHECK_GPU    GPU for the mask check (default "L4")
+    SYOK_H3_FACES_GPU    GPU for Fix faces (default: the swap's GPU, see faces_job)
+    SYOK_H3_FACES_MINUTES  hard cap on one Fix faces run (default 120)
     SYOK_H3_REGION       optional Modal region(s), comma separated, e.g. "ap" or "ap-southeast". Unset = no pin (Modal picks).
                          Modal bills a region pin at 1.15x (broad, e.g. "ap") or 1.75x (narrow, e.g. "ap-southeast") of the
                          base price, and whether the user's Modal plan may pin a region at all is NOT verified: see docs/H3.md.
@@ -37,11 +41,16 @@ HERE = Path(__file__).parent
 COMFYUI_REPO = "https://github.com/Comfy-Org/ComfyUI.git"
 COMFYUI_REF = "b53f77a74e21091cbdebfdf7b85fc80326932646"   # v0.41.2
 
-# Only the five packs the Simple and Check mask workflows need (openjutsu CUSTOM_NODES_REPORT.md section 1). Revisions:
+# Only the packs the Simple, Check mask and Fix faces workflows need (openjutsu CUSTOM_NODES_REPORT.md section 1). Revisions:
 #   recorded in CUSTOM_NODES_REPORT.md section 4 as a commit: Fantastic PromptBuilder 01b6d8d (1.8.1), VideoHelperSuite 115de7a (1.7.9)
 #   recorded only as a version, resolved here to the commit whose pyproject.toml first carries that version:
 #       Context Loop 0.7.3 -> 293ed6b, KJNodes 1.5.2 -> d3cfe21
 #   NOT recorded (TODO): comfyui-h3-oneclick-swap -> pinned to its HEAD as seen on 21 Nov 2026 (e44a56e), not a tested revision
+#       (it has H3FaceChunks / H3FaceJoin, the Fix faces chunk nodes, with every input face.api.json sets)
+#   Fix faces only (added 21 Nov 2026):
+#       H3-FaceRefine: recorded in the report as 1.0.0 (79a97ce). Its H3FaceTrackCrop / H3FaceMaskSAM / H3FaceStitch take
+#           exactly the inputs face.api.json sets (1.1.x adds more track inputs); checked against the source at that commit.
+#       Impact Pack (SAMLoader only): recorded as 8.28.3 only, resolved to the commit that set version 8.28.3 (5bed9d5).
 PACKS = [
     ("ComfyUI-MiniMaxH3-Context-Loop", "https://github.com/ethanfel/ComfyUI-MiniMaxH3-Context-Loop.git",
      "293ed6b6255ff684598302090f1411a4a1eb5648"),
@@ -52,7 +61,19 @@ PACKS = [
      "115de7a9d9e34410cffb9ecfd268e993b11a50fb"),
     ("comfyui-h3-oneclick-swap", "https://github.com/D3voz/comfyui-h3-oneclick-swap.git",
      "e44a56e92920000e675d14be484aea0d7498d63e"),
+    ("ComfyUI-H3-FaceRefine", "https://github.com/Carasibana/ComfyUI-H3-FaceRefine.git",
+     "79a97ce5ee4b393ce26313bd1280b706fe8b4f2c"),
+    ("ComfyUI-Impact-Pack", "https://github.com/ltdrdata/ComfyUI-Impact-Pack.git",
+     "5bed9d5545ef430406a5d6d7233e5c0a5e75051a"),
 ]
+# InsightFace for H3-FaceRefine's identity tracking, installed BEFORE the packs so the pack's unpinned "insightface" line is
+# already satisfied: 0.7.3 is the long-standing release with the FaceAnalysis(name, root, allowed_modules, providers) API the
+# pack calls (it builds a small C extension, hence build-essential). onnxruntime (CPU) runs it; the pack asks for CUDA first
+# and onnxruntime falls back to CPU, which only slows the few frames where identity is checked.
+FACE_PIP = ("insightface==0.7.3", "onnxruntime")
+# ComfyUI has no `ultralytics` model folder of its own (Impact Subpack would add one). This file registers models/ultralytics
+# on the models Volume, so H3FaceTrackCrop lists "bbox/face_yolov8m.pt" and "segm/person_yolov8m-seg.pt".
+EXTRA_MODEL_PATHS = "/opt/syok/comfy_extra_models.yaml"
 
 MODELS = "/h3models"        # syok-h3-models Volume: ComfyUI's models directory (--models-directory)
 JOBS = "/h3jobs"            # syok-h3-jobs Volume: job folders (meta.json, uploads, ComfyUI output + Context Loop checkpoints)
@@ -61,7 +82,11 @@ PORT = 8188
 
 GPU_SWAP = os.environ.get("SYOK_H3_GPU", "L40S")
 GPU_CHECK = os.environ.get("SYOK_H3_CHECK_GPU", "L4")
+# Fix faces loads the same H3 model, 32B text encoder and VAEs as the swap, on 512x512 face crops (smaller than any swap
+# canvas), so the swap's GPU is the one known to fit (the live 480p swap ran on it). Not measured on Modal yet.
+GPU_FACES = os.environ.get("SYOK_H3_FACES_GPU", GPU_SWAP)
 SWAP_MINUTES = int(os.environ.get("SYOK_H3_SWAP_MINUTES", "240"))   # hard cap on the paid GPU step (the first live test sets 45)
+FACES_MINUTES = int(os.environ.get("SYOK_H3_FACES_MINUTES", "120"))  # openjutsu: 17 s at 768p took ~28 min on a 4060 Ti
 REGION = [r.strip() for r in os.environ.get("SYOK_H3_REGION", "").split(",") if r.strip()] or None
 HF_SECRET = os.environ.get("SYOK_H3_HF_SECRET", "").strip()
 SECRETS = [modal.Secret.from_name(HF_SECRET)] if HF_SECRET else []
@@ -79,15 +104,18 @@ def _pack_cmd(name, url, rev):
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git", "ffmpeg", "libgl1", "libglib2.0-0")       # ffmpeg on PATH: Context Loop's final assembly needs it
+    .apt_install("git", "ffmpeg", "libgl1", "libglib2.0-0",       # ffmpeg on PATH: Context Loop's final assembly needs it
+                 "build-essential")                                # insightface 0.7.3 compiles a small extension
     .run_commands(f"git clone -q {COMFYUI_REPO} {COMFY} && cd {COMFY} && git checkout -q {COMFYUI_REF}")
     .run_commands(f"pip install -r {COMFY}/requirements.txt")
+    .run_commands("pip install " + " ".join(FACE_PIP))
     .run_commands(*[_pack_cmd(*p) for p in PACKS])
     .pip_install("huggingface_hub[hf_transfer]")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
     # Fail the cheap CPU build, not a paid GPU run, when a pack does not import (ComfyUI only logs "IMPORT FAILED").
     .run_commands(f"cd {COMFY} && python main.py --cpu --quick-test-for-ci > /tmp/qt.log 2>&1; cat /tmp/qt.log | tail -40; "
                   "! grep -q 'IMPORT FAILED' /tmp/qt.log")
+    .add_local_file(HERE / "comfy_extra_models.yaml", EXTRA_MODEL_PATHS)           # models/ultralytics (Fix faces)
     .add_local_file(HERE / "h3_engine.py", "/opt/syok/h3_engine.py")
     .add_local_file(HERE / "texture_service.py", "/opt/syok/texture_service.py")     # job folder + meta.json helpers
     .add_local_file(HERE / "texture_transfer.py", "/opt/syok/texture_transfer.py")   # imported by texture_service
@@ -135,8 +163,8 @@ def _start_comfy(job_dir):
     log = open("/tmp/comfy.log", "w")
     proc = subprocess.Popen(
         [sys.executable, "main.py", "--listen", "127.0.0.1", "--port", str(PORT), "--disable-auto-launch",
-         "--models-directory", MODELS, "--input-directory", str(inp), "--output-directory", str(out),
-         "--temp-directory", str(tmp)], cwd=COMFY, stdout=log, stderr=subprocess.STDOUT)
+         "--models-directory", MODELS, "--extra-model-paths-config", EXTRA_MODEL_PATHS, "--input-directory", str(inp),
+         "--output-directory", str(out), "--temp-directory", str(tmp)], cwd=COMFY, stdout=log, stderr=subprocess.STDOUT)
     for _ in range(600):                                          # custom nodes can take a while to import
         if proc.poll() is not None:
             raise RuntimeError("ComfyUI exited at start:\n" + Path("/tmp/comfy.log").read_text()[-3000:])
@@ -208,6 +236,11 @@ def _stage(job, stage, node_id, timeout_s, failure):
         raise
     finally:
         jobs.commit()
+        if stage == "faces":
+            try:
+                models.commit()     # InsightFace downloads buffalo_l into models/insightface on the first Fix faces run
+            except Exception:
+                pass
     return eng.status(JOBS, job)
 
 
@@ -229,6 +262,16 @@ def swap_job(job: str):
                   "The swap failed. Start it again on the same job: it resumes from the last finished clip.")
 
 
+@app.function(image=image, gpu=GPU_FACES, region=REGION, memory=65536, volumes={MODELS: models, JOBS: jobs},
+              timeout=FACES_MINUTES * 60, max_containers=1)
+def faces_job(job: str):
+    """Optional paid step, only when the user asks (POST /fixfaces): openjutsu Fix faces on the finished swap (h3.mp4) with
+    the same photo. Starting it again after an error runs it again from the start (no checkpoints)."""
+    eng = _eng()
+    return _stage(job, "faces", eng.node_by_title(eng.load_workflow("face"), "Fixed video"), FACES_MINUTES * 60 - 300,
+                  "Fix faces failed. Try again: it runs again from the start.")
+
+
 @app.function(image=light, volumes={MODELS: models}, secrets=SECRETS, cpu=4, timeout=4 * 3600)
 def fetch_models(sources: dict):
     """Download each model file straight into the models Volume (huggingface_hub, inside Modal; nothing on any PC).
@@ -248,7 +291,11 @@ def fetch_models(sources: dict):
                 continue
             s = src[m["file"]]
             tmp = Path(MODELS) / ".partial"
-            p = Path(hf_hub_download(s["repo_id"], s["path_in_repo"], revision=s.get("revision"), local_dir=str(tmp)))
+            if s.get("url"):                         # an official non-HF download (SAM vit_b from Meta), sha256-checked
+                p = eng.download_url(s, tmp, m["file"])
+            else:
+                p = Path(hf_hub_download(s["repo_id"], s["path_in_repo"], revision=s.get("revision"), local_dir=str(tmp)))
+                eng.verify_download(p, s)            # only sources that record a size / sha256 are checked
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(p), dest)
             models.commit()
@@ -270,6 +317,12 @@ def model_sizes():
         f = Path(MODELS) / m["folder"] / m["file"]
         out.append((f"{m['folder']}/{m['file']}", f.stat().st_size if f.is_file() else None))
     return out
+
+
+@app.function(image=light, volumes={MODELS: models}, cpu=1, timeout=120)
+def model_missing_faces():
+    models.reload()
+    return _eng().models_missing(MODELS, "faces")
 
 
 @app.function(image=light, volumes={JOBS: jobs}, cpu=2, timeout=600)
@@ -333,8 +386,12 @@ def web():
     def weights_state():
         return eng.weights_state(MODELS)
 
+    def faces_weights_state():
+        return eng.weights_state(MODELS, stages=("faces",))
+
     return h3_api.build_h3_app(JOBS, check_job.spawn, swap_job.spawn, lambda: fetch_models.spawn({}), weights_state,
-                               before_read=reload, after_write=jobs.commit)
+                               before_read=reload, after_write=jobs.commit, spawn_faces=faces_job.spawn,
+                               faces_weights_state=faces_weights_state)
 
 
 # ---------------------------------------------------------------- local entry points
@@ -383,6 +440,28 @@ def swap(job: str, out: str = "h3.mp4"):
         print("Resuming from the last finished clip.")
     print(json.dumps(swap_job.remote(job), indent=1))
     Path(out).write_bytes(read_result.remote(job, "swap"))
+    print("Saved", out)
+
+
+@app.function(image=light, volumes={JOBS: jobs}, cpu=1, timeout=300)
+def queue_faces(job: str, mode: str):
+    """Mark Fix faces queued (refuses it before the swap is done, while running, or once done)."""
+    eng = _eng()
+    jobs.reload()
+    out = eng.start_faces(JOBS, job, mode)
+    jobs.commit()
+    return bool(out)
+
+
+@app.local_entrypoint()
+def fixfaces(job: str, mode: str = "photo", out: str = "faces.mp4"):
+    """Optional and paid. Uses the InsightFace buffalo_l face model: non-commercial research use only (see docs/H3.md)."""
+    missing = model_missing_faces.remote()
+    if missing:
+        raise SystemExit("Fix faces model files are missing: " + ", ".join(missing) + ". Run: modal run h3_app.py::fetch")
+    queue_faces.remote(job, mode)
+    print(json.dumps(faces_job.remote(job), indent=1))
+    Path(out).write_bytes(read_result.remote(job, "faces"))
     print("Saved", out)
 
 
